@@ -45,6 +45,7 @@ import datetime
 import getpass
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -706,9 +707,10 @@ class EmbyAPI:
 def authenticate(server_url: str, username: str, password: str) -> Dict[str, Any]:
     """Authenticate with Emby and return the raw response payload."""
     server_url = server_url.rstrip("/")
+    node_name = platform.node() or "device"
     auth_header = (
         f'MediaBrowser Client="{PROG}", Device="CLI", '
-        f'DeviceId="{PROG}-{os.uname().nodename}", Version="{VERSION}"'
+        f'DeviceId="{PROG}-{node_name}", Version="{VERSION}"'
     )
     body = json.dumps({"Username": username, "Pw": password}).encode("utf-8")
     request = urllib.request.Request(

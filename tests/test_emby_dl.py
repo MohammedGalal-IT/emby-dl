@@ -731,7 +731,8 @@ class EmbyToolTest(unittest.TestCase):
         self.assertNotIn("newtoken", result.stdout)
         saved = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["access_token"], "newtoken")
-        self.assertEqual(oct(self.config_path.stat().st_mode & 0o777), "0o600")
+        if os.name != "nt":
+            self.assertEqual(oct(self.config_path.stat().st_mode & 0o777), "0o600")
 
         auth = self.run_tool("auth", "--json")
         self.assertEqual(auth.returncode, 0, auth.stderr)
@@ -954,7 +955,8 @@ class EmbyToolTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         header_file = self.downloads / ".emby_dl_headers"
         self.assertTrue(header_file.exists())
-        self.assertEqual(oct(header_file.stat().st_mode & 0o777), "0o600")
+        if os.name != "nt":
+            self.assertEqual(oct(header_file.stat().st_mode & 0o777), "0o600")
         self.assertIn("token", header_file.read_text(encoding="utf-8"))
         # The process is gone by now; the key property is that no argv ever
         # contains the token: the download completed using -K <file>.
