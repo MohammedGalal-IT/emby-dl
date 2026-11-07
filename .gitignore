@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Emby DL runtime credentials and downloaded media
+.emby_config
+downloads/
+*.part
+.emby_dl_headers
+.emby_dl_caps.json
+.emby_dl_state.json
+.emby_dl.lock
+
+# Test artifacts and caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local deb / package artifacts
+*.deb
+*.log
+.playwright-mcp/
+package-lock.json
+
+# Exploratory dump files from early probing
+*.yml
+!/.github/workflows/*.yml
