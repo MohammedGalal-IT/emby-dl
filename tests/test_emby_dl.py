@@ -6,7 +6,6 @@ No pytest required; the tool is exercised as a subprocess with real curl.
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
@@ -570,13 +569,10 @@ class EmbyToolTest(unittest.TestCase):
         self.assertEqual(self.stream_count("e11"), 2)
 
     def test_lock_busy_exit_5(self):
-        lock_path = self.downloads / ".emby_dl.lock"
-        with open(lock_path, "a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            try:
-                result = self.run_tool("--json", "Alpha Show", "S1", "E1")
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from emby_dl import DownloadLock
+        with DownloadLock(str(self.downloads)):
+            result = self.run_tool("--json", "Alpha Show", "S1", "E1")
         self.assertEqual(result.returncode, 5)
         payload = self.last_json(result.stdout)
         self.assertEqual(payload["code"], 5)

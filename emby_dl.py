@@ -1902,7 +1902,7 @@ class DownloadEngine:
             path = os.path.join(directory, ".emby_dl_headers")
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(f'H "X-Emby-Token: {self.api.token}"\n')
+                handle.write(f'header = "X-Emby-Token: {self.api.token}"\n')
             return os.path.abspath(path).replace("\\", "/")
         except OSError as exc:
             raise ConfigError(f"Could not create private curl header file: {exc}")
