@@ -1037,7 +1037,7 @@ class DatasetManager:
                         "episode_number": episode,
                         "original_name": previous.get("original_name", ""),
                         "file_name": file_name,
-                        "relative_path": os.path.relpath(path, self.downloads_path),
+                        "relative_path": os.path.relpath(path, self.downloads_path).replace("\\", "/"),
                         "size_bytes": size_bytes,
                         "size_mb": int(round(size_bytes / 1048576)),
                         "container": container.lower(),
@@ -1662,8 +1662,9 @@ def episode_destination(downloads_path: str, series_name: str, season: int,
                         episode: int, container: str) -> Tuple[str, str, str]:
     safe_series = sanitize_filename(series_name)
     file_name = f"{safe_series} - S{int(season):02d}E{int(episode):02d}.{container}"
-    relative = os.path.join(safe_series, f"Season {int(season)}", file_name)
-    return os.path.join(downloads_path, relative), relative, file_name
+    relative = f"{safe_series}/Season {int(season)}/{file_name}"
+    dest = os.path.join(downloads_path, safe_series, f"Season {int(season)}", file_name)
+    return dest, relative, file_name
 
 
 def _episode_status(dataset: DatasetManager, downloads_path: str, series_name: str,
@@ -2540,7 +2541,7 @@ def cmd_verify(args: argparse.Namespace, config: Dict[str, Any],
             "source_index": entry.get("source_index"),
             "source_name": entry.get("source_name"),
             "media_source_id": entry.get("media_source_id"),
-            "path": os.path.relpath(path, downloads_path),
+            "path": os.path.relpath(path, downloads_path).replace("\\", "/"),
             "expected_bytes": expected,
             "disk_bytes": disk_bytes,
             "status": "ok" if issue is None else "issue",
@@ -2558,7 +2559,7 @@ def cmd_verify(args: argparse.Namespace, config: Dict[str, Any],
                 "season_id": entry.get("season_id", ""),
                 "title": entry.get("file_name", ""),
                 "container": entry.get("container", "mkv"),
-                "relative_path": os.path.relpath(path, downloads_path),
+                "relative_path": os.path.relpath(path, downloads_path).replace("\\", "/"),
                 "path": path,
                 "size_bytes": expected,
                 "source_spec": source_spec,
