@@ -1,0 +1,30 @@
+{
+  "server_url": "http://emby.example.com:8096",
+  "server_id": "",
+  "user_id": "",
+  "access_token": "YOUR_ACCESS_TOKEN_HERE",
+  "username": "user",
+  "downloads_path": "./downloads",
+  "download_settings": {
+    "speed_limit_bytes": 5000,
+    "speed_time_seconds": 60,
+    "max_retries": 5,
+    "retry_delay_seconds": 5,
+    "retry_backoff_initial_seconds": 15,
+    "retry_backoff_max_seconds": 600,
+    "resume_enabled": true,
+    "resume_stall_seconds": 10,
+    "disk_reserve_bytes": 2147483648,
+    "api_timeout_seconds": 20,
+    "api_retries": 1,
+    "head_timeout_seconds": 6
+  },
+  "notifications": {
+    "desktop": false,
+    "webhook_url": "",
+    "telegram_chat_id": "",
+    "notify_on_start": false,
+    "notify_on_complete": true,
+    "notify_on_failure": true
+  }
+}

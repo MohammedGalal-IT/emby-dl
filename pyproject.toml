@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "emby-dl"
+version = "1.2.0"
+description = "A hardened, single-stream CLI downloader for Emby with byte-exact verification."
+readme = "tools/README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "Mohammed" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Environment :: Console",
+    "Topic :: Multimedia :: Video",
+]
+
+[project.scripts]
+emby-dl = "emby_dl:main"
+emby_dl = "emby_dl:main"
+
+[tool.setuptools]
+py-modules = ["emby_dl"]
