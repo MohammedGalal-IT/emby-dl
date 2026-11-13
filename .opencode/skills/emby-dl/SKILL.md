@@ -92,7 +92,8 @@ If `ok: true`, all pre-flight diagnostic systems are healthy:
 8. `dataset`: Consistency check passes (`dataset --check`).
 9. `dataset_schema`: Schema version is current (Schema v3).
 10. `server_reachable` & `token_valid`: Real-time ping and authentication to Emby server.
-11. `telegram_bot` & `telegram_chat`: Token authentication via Telegram `getMe` and chat ID verification (if configured).
+11. `ffmpeg`: Auto-detected (`ffmpeg_path` → `$PATH` → known Windows locations). Required and enforced in `hls` mode; reports `not required` in `direct` mode.
+12. `telegram_bot` & `telegram_chat`: Token authentication via Telegram `getMe` and chat ID verification (if configured).
 
 ---
 
@@ -297,7 +298,12 @@ The Flower of Evil - زهرة الشر S1 E1-10
 
 ## 8. HLS Streaming Mode & Lossless Remux Architecture
 
-For servers running Emby 4.x that hang on HTTP `Range:` headers or throttle single direct streams, configure `"download_mode": "hls"` in `config.json`.
+**`"download_mode": "hls"` is the DEFAULT** (matched to the home-server profile). For servers running Emby 4.x that hang on HTTP `Range:` headers or throttle single direct streams, no configuration is needed. To switch to the single-stream fallback, set `"download_mode": "direct"` in `config.json` — completed episodes are never re-fetched when switching.
+
+### ffmpeg Auto-Detection & Missing-Tool Behaviour:
+`emby-dl` locates ffmpeg automatically in this order: (1) `download_settings.ffmpeg_path` if set (default empty), (2) `ffmpeg` on `PATH`, (3) known Windows install locations. `ffprobe` is resolved next to the found binary.
+- **Missing ffmpeg in `hls` mode:** the tool fails fast BEFORE downloading with `ConfigError: HLS mode needs ffmpeg. Install it (winget install Gyan.FFmpeg) or set download_settings.ffmpeg_path.` — fix by installing ffmpeg (`winget install Gyan.FFmpeg`) or pointing `ffmpeg_path` at an existing binary, or falling back to `"download_mode": "direct"`.
+- **`doctor` check:** reports `ffmpeg: found/missing` in `hls` mode and `not required` in `direct` mode.
 
 ### Two-Stage Lossless Remux Pipeline:
 Emby's live HLS transcoder emits MPEG-TS segments where video packets frequently lack timestamps. Direct Matroska muxing fails with `Can't write packet with unknown timestamp`. `emby-dl` solves this natively:

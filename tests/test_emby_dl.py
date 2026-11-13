@@ -395,6 +395,7 @@ class EmbyToolTest(unittest.TestCase):
             "username": "tester",
             "downloads_path": str(self.downloads),
             "download_settings": {
+                "download_mode": "direct",
                 "speed_limit_bytes": 5000,
                 "speed_time_seconds": 1,
                 "max_retries": 2,
@@ -998,6 +999,9 @@ class EmbyToolTest(unittest.TestCase):
         payload = self.last_json(result.stdout)
         names = {check["name"] for check in payload["checks"]}
         self.assertNotIn("server_reachable", names)
+        ffmpeg = next(c for c in payload["checks"] if c["name"] == "ffmpeg")
+        self.assertTrue(ffmpeg["ok"])
+        self.assertEqual(ffmpeg["status"], "not required")
 
     def test_doctor_flags_missing_token(self):
         self.write_config(access_token="")

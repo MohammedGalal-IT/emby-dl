@@ -18,7 +18,8 @@ env/
 .env
 .env.*
 .emby_config
-config.json
+.config.local.json
+.config.local.backup
 downloads/
 *.part
 .emby_dl_headers

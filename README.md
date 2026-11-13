@@ -83,7 +83,7 @@ cp completions/emby_dl.fish ~/.config/fish/completions/
 
 ### 1. Ready Out of the Box (Zero-Config)
 
-If you are on the home network, **`emby-dl` works right away** without any setup. It connects to `http://10.10.10.9:8096` using `دخول الاستراحة 2` and downloads to `~/Downloads/Emby` (or `%USERPROFILE%\Downloads\Emby` on Windows):
+If you are on the home network, **`emby-dl` works right away** without any setup. It connects to `http://10.10.10.9:8096` using `دخول الاستراحة 2` and downloads to `~/Downloads/Emby` (or `%USERPROFILE%\Downloads\Emby` on Windows). All default download settings (HLS mode, stall thresholds, retries, timeouts) are pre-tuned to match the home-server profile — installing on another machine behaves identically out of the box:
 
 ```bash
 # Verify connection to the home server
@@ -93,6 +93,37 @@ emby-dl doctor
 emby-dl plan "Black Clover" S1 E1
 emby-dl "Black Clover" S1 E1
 ```
+
+### 1a. Download Modes: `hls` (default) vs `direct`
+
+`download_mode` in `config.json` selects the transfer engine. **The default is `"hls"`** — it bypasses the `Range:`-header hangs and long-stream throttling of Emby 4.9 servers by downloading many small 6-second MPEG-TS segments and remuxing them losslessly (`TS → MP4 → MKV/MP4`) without re-encoding:
+
+| | `hls` *(default)* | `direct` |
+|---|---|---|
+| Requires | `ffmpeg` (auto-detected) | `curl` only |
+| Survives server resets / resumes across runs | ✅ natively | ⚠️ only with `resume_enabled: true` |
+| Timestamp & audio-sync repair | ✅ automatic | n/a |
+
+To switch, edit one line in `config.json`:
+
+```json
+"download_settings": { "download_mode": "hls" }
+```
+
+Already-downloaded episodes are never re-fetched when you switch modes. See `tools/README.md` § 1.2a for the full comparison table.
+
+### 1b. ffmpeg: Auto-Detection & What Happens When It Is Missing
+
+HLS remuxing needs `ffmpeg`, but **no manual path configuration is required**. The tool searches in order: (1) `download_settings.ffmpeg_path` if set, (2) `ffmpeg` on `PATH`, (3) known Windows install locations. `ffprobe` is resolved next to it.
+
+If ffmpeg cannot be found in `hls` mode, the tool **fails fast before downloading anything** with an actionable message:
+
+```text
+ConfigError: HLS mode needs ffmpeg. Install it (winget install Gyan.FFmpeg)
+or set download_settings.ffmpeg_path.
+```
+
+Run `emby-dl doctor` to check ffmpeg availability up front: it reports `ffmpeg: found` (or `missing`) in `hls` mode and `not required` in `direct` mode. See `tools/README.md` § 1.2b for details.
 
 ### 2. Custom Server Setup (`init`)
 

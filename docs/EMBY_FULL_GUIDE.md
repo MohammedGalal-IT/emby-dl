@@ -113,13 +113,13 @@ Known series IDs verified and downloaded in this project:
 2. Query `/Shows/{id}/Seasons` and `/Shows/{id}/Episodes?...` for exact byte sizes.
 3. Preflight check: `free_disk - disk_reserve_bytes >= file_size`.
 4. If `.part` file exists, perform one short Range probe (10s). When it hangs (it will on this server), delete `.part`.
-5. Download via `curl -f -L -K <headers_file> --speed-limit 5000 --speed-time 60` into `.part`.
+5. Download via `curl -f -L -K <headers_file> --speed-limit 1000 --speed-time 1800` (stall-detection thresholds, **not** a bandwidth cap: abort only if speed stays below 1 KB/s for 30 minutes).
 6. Validate exact byte count and content type (reject text/plain, HTML, JSON).
 7. Atomically rename `.part` -> destination file and write dataset entry.
 
 ### 3.2 HLS Segment Engine Mechanics [VERIFIED 2026-11-08]
 
-Because direct downloads cannot be resumed when the server or connection drops, `emby-dl` implements an **HLS Segment Engine** (`"download_mode": "hls"`):
+Because direct downloads cannot be resumed when the server or connection drops, `emby-dl` implements an **HLS Segment Engine** (`"download_mode": "hls"`). **HLS is the tool default** as of v1.3.0; the single-stream fallback is `"download_mode": "direct"`. Switching between them never re-downloads completed episodes (dataset entries are authoritative).
 
 1. **Session Negotiation:**
    Calls `POST /Items/{item_id}/PlaybackInfo` with `{UserId, StartTimeTicks: 0, IsPlayback: True}`.
@@ -167,6 +167,22 @@ MPEG-4 container muxers (`-f mp4`) tolerate and reconstruct missing presentation
 
 When ffmpeg is invoked from background processes, daemon threads, or Windows PowerShell subshells without an interactive console, it attempts to read keyboard input from `stdin`. This results in a silent, indefinite 30-minute freeze until the subprocess timeout fires (`hls_error: timed out`).
 **Mandatory Fix:** Every invocation of `ffmpeg` and `ffprobe` in `emby-dl` includes `-nostdin`. Remuxing completes in 10–25 seconds.
+
+### 3.4a ffmpeg Auto-Detection & Missing-Tool Behaviour
+
+`emby-dl` locates ffmpeg automatically on every HLS remux, in priority order:
+1. **`download_settings.ffmpeg_path`** — explicit path (default: empty).
+2. **`ffmpeg` on `PATH`** — standard `shutil.which` lookup.
+3. **Known Windows locations** — e.g. `C:\Program Files\DownloadHelper CoApp\ffmpeg.exe` (the home workstation's ffmpeg is found here even with an empty `ffmpeg_path`).
+
+`ffprobe` is resolved next to the located ffmpeg binary, falling back to `PATH`.
+
+**If ffmpeg is missing while mode is `hls`:** the tool raises a fail-fast error BEFORE any bytes are downloaded:
+```text
+ConfigError: HLS mode needs ffmpeg. Install it (winget install Gyan.FFmpeg)
+or set download_settings.ffmpeg_path.
+```
+Recovery: install ffmpeg (`winget install Gyan.FFmpeg`), set `ffmpeg_path` to an existing binary, or switch to `"download_mode": "direct"`. `emby-dl doctor` reports the `ffmpeg` check as `found`/`missing` in `hls` mode and `not required` in `direct` mode.
 
 ### 3.5 Duration Padding Tolerance [VERIFIED 2026-11-10]
 
