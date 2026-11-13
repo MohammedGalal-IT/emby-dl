@@ -82,31 +82,34 @@ The real config is `config.json` at the project root and must be mode `600`.
   "downloads_path": "./downloads",
   "download_settings": {
     "download_mode": "hls",
-    "speed_limit_bytes": 5000,
-    "speed_time_seconds": 60,
+    "speed_limit_bytes": 1000,
+    "speed_time_seconds": 1800,
     "max_retries": 5,
     "retry_delay_seconds": 5,
     "retry_backoff_initial_seconds": 15,
     "retry_backoff_max_seconds": 600,
-    "resume_enabled": true,
+    "resume_enabled": false,
     "resume_stall_seconds": 10,
     "hls_workers": 4,
     "hls_segment_retries": 4,
-    "ffmpeg_path": "ffmpeg",
+    "ffmpeg_path": "",
     "queue_item_reschedule_rounds": 2,
     "disk_reserve_bytes": 2147483648,
-    "api_timeout_seconds": 20,
-    "api_retries": 1,
-    "head_timeout_seconds": 6
+    "api_timeout_seconds": 60,
+    "api_retries": 3,
+    "head_timeout_seconds": 6,
+    "completion_grace_seconds": 15,
+    "idle_timeout_seconds": 3600
   },
   "notifications": {
-    "desktop": false,
+    "desktop": true,
     "webhook_url": "",
     "telegram_bot_token": "",
     "telegram_chat_id": "",
     "notify_on_start": false,
     "notify_on_complete": true,
-    "notify_on_failure": true
+    "notify_on_failure": true,
+    "stall_alert_seconds": 300
   }
 }
 ```
@@ -114,37 +117,51 @@ The real config is `config.json` at the project root and must be mode `600`.
 `server_url` and `access_token` are required. `server_id`, `user_id` and
 `username` are informational but used by `auth` and `login`.
 
+These defaults match the home-server profile exactly: the tool is tuned for the
+`http://10.10.10.9:8096` Emby 4.9 server out of the box (HLS mode, long stall
+windows, 60s API timeout). Installing on another machine reproduces the same
+behaviour without editing anything.
+
 `downloads_path` may be relative; it always resolves against the directory that
 contains the config file. `--downloads-dir` overrides it for one run (relative to
 the CWD in that case).
 
 #### Download settings
 
+> **Note:** `speed_limit_bytes` and `speed_time_seconds` are **stall-detection
+> thresholds, not a bandwidth cap**. They map directly to curl's
+> `--speed-limit` / `--speed-time`: a download is aborted as "stalled" only when
+> its transfer speed stays below `speed_limit_bytes` bytes/sec for
+> `speed_time_seconds` continuously. The default (1000 B/s for 1800 s) tolerates
+> a very slow, throttling home server — it does **not** limit your speed.
+
 | Key | Default | Meaning |
 |---|---:|---|
-| `download_mode` | `"hls"` | `"hls"` (resilient segment download + lossless remux) or `"direct"` (single HTTP stream) |
-| `speed_limit_bytes` | `5000` | stall threshold, **not** a bandwidth cap |
-| `speed_time_seconds` | `60` | how long a transfer may stay under the threshold before curl aborts |
+| `download_mode` | `"hls"` | `"hls"` (resilient segment download + lossless remux) or `"direct"` (single HTTP stream) — see [Switching download modes](#switching-download-modes-direct--hls) |
+| `speed_limit_bytes` | `1000` | stall threshold (min transfer speed), **not** a bandwidth cap |
+| `speed_time_seconds` | `1800` | how long a transfer may stay under the threshold before curl aborts |
 | `max_retries` | `5` | fresh-download attempts per file |
 | `retry_delay_seconds` | `5` | legacy pause value (kept for compatibility) |
 | `retry_backoff_initial_seconds` | `15` | first health-gated backoff: 15 → 30 → 60 → 120 … |
 | `retry_backoff_max_seconds` | `600` | backoff cap; the tool waits for `/System/Info/Public` before retrying |
-| `resume_enabled` | `true` | attempt one short Range probe on an existing `.part` in direct mode |
+| `resume_enabled` | `false` | attempt one short Range probe on an existing `.part` in direct mode (unnecessary in HLS mode, which resumes natively) |
 | `resume_stall_seconds` | `10` | short stall window for that probe |
 | `hls_workers` | `4` | concurrent curl worker threads downloading independent HLS segments (1–8) |
 | `hls_segment_retries` | `4` | retry attempts per failed HLS segment before refreshing session |
-| `ffmpeg_path` | `"ffmpeg"` | path to ffmpeg executable for lossless remuxing |
+| `ffmpeg_path` | `""` | explicit path to ffmpeg. Empty = **auto-detect** (see below) |
 | `queue_item_reschedule_rounds` | `2` | automatic failure rescheduling rounds before marking an episode failed |
 | `disk_reserve_bytes` | `2147483648` | free space kept untouched (2 GiB) |
-| `api_timeout_seconds` | `20` | JSON API request timeout |
-| `api_retries` | `1` | API retries after an HTTP 5xx or connection error |
+| `api_timeout_seconds` | `60` | JSON API request timeout |
+| `api_retries` | `3` | API retries after an HTTP 5xx or connection error |
 | `head_timeout_seconds` | `6` | last-resort HEAD size probe timeout |
+| `completion_grace_seconds` | `15` | extra wait for stragglers before declaring an HLS episode complete |
+| `idle_timeout_seconds` | `3600` | abort a transfer with zero progress for this long |
 
 #### Notification settings
 
 | Key | Default | Meaning |
 |---|---|---|
-| `desktop` | `false` | desktop notifications (PowerShell balloon tips on Windows, `notify-send` on Linux) |
+| `desktop` | `true` | desktop notifications (PowerShell balloon tips on Windows, `notify-send` on Linux) |
 | `webhook_url` | `""` | POST a JSON body when a batch finishes |
 | `telegram_bot_token` | `""` | Telegram bot token (enables alerts and interactive two-way bot commands) |
 | `telegram_chat_id` | `""` | target chat ID for Telegram messages |
@@ -156,6 +173,74 @@ Telegram is supported both via webhook and via native bot integration (`telegram
 
 `--notify` enables desktop notifications for one run. `--webhook URL` overrides the
 webhook for one run. Neither changes the config file.
+
+### 1.2a Switching download modes (`direct` ↔ `hls`)
+
+`download_mode` in `config.json` selects the transfer engine. **The default is
+`"hls"`.**
+
+| | `hls` *(default)* | `direct` |
+|---|---|---|
+| How it works | Many small 6-second MPEG-TS segments via the live transcode endpoint, concatenated raw and remuxed losslessly (`TS → MP4 → MKV/MP4`) | One single HTTP stream request (`/Videos/{id}/stream?static=true`) |
+| Requires | `ffmpeg` (+ `ffprobe`) | `curl` only |
+| Survives server resets | ✅ each segment is an independent request | ❌ a reset kills the transfer |
+| Resumes across runs | ✅ natively (completed segments are kept in `<dest>.hls`) | ⚠️ only with `resume_enabled: true` (Range probe) |
+| Timestamp/audio-sync handling | ✅ repaired automatically by the remux pipeline | n/a (server-made file) |
+| Best for | Emby 4.9 servers that hang on `Range:` headers or throttle long streams | servers with healthy direct-stream support, or when ffmpeg cannot be installed |
+
+**How to switch** — edit `config.json` (no restart flags needed; applies to the
+next run):
+
+```json
+"download_settings": {
+  "download_mode": "hls"      // or "direct"
+}
+```
+
+```bash
+# Verify which mode will be used before downloading:
+tools/emby_dl plan "Series Name" S1 --json      # reports the plan, no side effects
+tools/emby_dl doctor                            # ffmpeg check follows the mode (see below)
+```
+
+Notes:
+- Switching modes does **not** re-download finished episodes: completed entries
+  recorded in `downloaded_dataset.json` are always skipped.
+- A partially-downloaded `.part` file from `direct` mode is ignored by `hls`
+  mode (it rebuilds from its own `<dest>.hls` segment folder) and vice versa;
+  delete the stale artifact if you switch modes mid-episode.
+- If ffmpeg is unavailable and you cannot install it, set `"download_mode":
+  "direct"` — HLS remuxing is the only thing that needs ffmpeg.
+
+### 1.2b ffmpeg: auto-detection & missing-tool behaviour
+
+`emby-dl` never requires you to hand-edit an ffmpeg path. It locates ffmpeg in
+this order on every HLS remux:
+
+1. **`download_settings.ffmpeg_path`** — explicit path, if set (default: empty).
+2. **`ffmpeg` on `PATH`** — standard lookup (`shutil.which`).
+3. **Windows known locations** — e.g. `C:\Program Files\DownloadHelper CoApp\ffmpeg.exe`.
+
+`ffprobe` is resolved next to the found ffmpeg binary, falling back to `PATH`.
+
+**If ffmpeg cannot be found** (and mode is `hls`), the tool fails fast with a
+clear, actionable error **before** downloading anything:
+
+```text
+ConfigError: HLS mode needs ffmpeg. Install it (winget install Gyan.FFmpeg)
+or set download_settings.ffmpeg_path.
+```
+
+Fix options:
+```bash
+winget install Gyan.FFmpeg          # Windows: install ffmpeg into PATH
+# or point the config at an existing binary:
+#   "ffmpeg_path": "C:\\path\\to\\ffmpeg.exe"
+```
+
+`emby-dl doctor` reports this explicitly: in `hls` mode the `ffmpeg` check is
+**FAIL/missing** when the binary cannot be located, and in `direct` mode it
+reports `not required` (so doctor stays green on ffmpeg-less machines).
 
 ### 1.3 Logging in / refreshing a token
 
@@ -525,10 +610,10 @@ a **Three-Level Failure Rescheduling Architecture**:
 
 ### 3.8 HLS Streaming Mode & Lossless Remuxing Pipeline
 
-For servers running Emby 4.x that hang on HTTP `Range:` headers or throttle single direct streams,
-`emby-dl` provides an advanced **HLS Segment Engine**:
+HLS is the **default** download mode (`"download_mode": "hls"`), ideal for servers running
+Emby 4.x that hang on HTTP `Range:` headers or throttle single direct streams:
 
-- **Configuration:** Set `"download_mode": "hls"` in `config.json`.
+- **Configuration:** `"download_mode": "hls"` (default — no change needed). Set `"direct"` to fall back to a single HTTP stream (see section 1.2a for the full comparison and switching guide).
 - **Parallel Segment Fetching:** Downloads small `.ts` segments concurrently using worker threads
   (`hls_workers`, default 4) with per-segment auto-retry (`hls_segment_retries`).
 - **Lossless Remux Pipeline:** Segments are losslessly concatenated and remuxed into MKV or MP4.
@@ -788,16 +873,17 @@ tools/emby_dl doctor --json
 
 Output checks:
 1. `curl`: binary found in `$PATH`.
-2. `server_url` & `access_token`: configured.
-3. `env_overrides`: active `EMBY_*` environment variables.
-4. `config_permissions`: config file is mode `0600`.
-5. `downloads_dir`: directory exists and is writable.
-6. `disk_space`: available free disk vs reserve.
-7. `dataset`: runs `dataset --check`.
-8. `dataset_schema`: matches v3.
-9. `server_reachable` & `token_valid`: live server health check.
-10. `telegram_bot`: verifies `telegram_bot_token` validity via Telegram `getMe` API and checks bot username.
-11. `telegram_chat`: verifies `telegram_chat_id` configuration.
+2. `ffmpeg`: required for `download_mode: "hls"`; auto-detected via `ffmpeg_path` → `$PATH` → known Windows locations. Reports `not required` in `direct` mode.
+3. `server_url` & `access_token`: configured.
+4. `env_overrides`: active `EMBY_*` environment variables.
+5. `config_permissions`: config file is mode `0600`.
+6. `downloads_dir`: directory exists and is writable.
+7. `disk_space`: available free disk vs reserve.
+8. `dataset`: runs `dataset --check`.
+9. `dataset_schema`: matches v3.
+10. `server_reachable` & `token_valid`: live server health check.
+11. `telegram_bot`: verifies `telegram_bot_token` validity via Telegram `getMe` API and checks bot username.
+12. `telegram_chat`: verifies `telegram_chat_id` configuration.
 
 Exits `0` if all checks pass, `1` if any check fails.
 

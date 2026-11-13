@@ -1,0 +1,37 @@
+{
+  "server_url": "http://10.10.10.9:8096",
+  "server_id": "335a39030db14fc0919f6da76570e4db",
+  "user_id": "f5d170effc9b40d4a6183b9288c1d055",
+  "access_token": "",
+  "username": "دخول الاستراحة 2",
+  "downloads_path": "D:\\film",
+  "download_settings": {
+    "speed_limit_bytes": 1000,
+    "speed_time_seconds": 1800,
+    "max_retries": 5,
+    "retry_delay_seconds": 5,
+    "retry_backoff_initial_seconds": 15,
+    "retry_backoff_max_seconds": 600,
+    "resume_enabled": false,
+    "resume_stall_seconds": 10,
+    "download_mode": "hls",
+    "hls_workers": 4,
+    "hls_segment_retries": 4,
+    "ffmpeg_path": "C:\\Program Files\\DownloadHelper CoApp\\ffmpeg.exe",
+    "disk_reserve_bytes": 2147483648,
+    "api_timeout_seconds": 60,
+    "api_retries": 3,
+    "head_timeout_seconds": 6,
+    "completion_grace_seconds": 15,
+    "idle_timeout_seconds": 3600
+  },
+  "notifications": {
+    "desktop": true,
+    "webhook_url": "",
+    "telegram_chat_id": "",
+    "telegram_bot_token": "",
+    "notify_on_start": false,
+    "notify_on_complete": true,
+    "notify_on_failure": true
+  }
+}

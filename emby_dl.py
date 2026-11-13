@@ -94,15 +94,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "username": "دخول الاستراحة 2",
     "downloads_path": "./downloads",
     "download_settings": {
-        "speed_limit_bytes": 5000,
-        "speed_time_seconds": 60,
+        "speed_limit_bytes": 1000,
+        "speed_time_seconds": 1800,
         "max_retries": 5,
         "retry_delay_seconds": 5,
         "retry_backoff_initial_seconds": 15,
         "retry_backoff_max_seconds": 600,
-        "resume_enabled": True,
+        "resume_enabled": False,
         "resume_stall_seconds": 10,
-        "download_mode": "direct",
+        "download_mode": "hls",
         "hls_workers": 4,
         "hls_segment_retries": 4,
         "ffmpeg_path": "",
@@ -111,10 +111,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "api_retries": 3,
         "head_timeout_seconds": 6,
         "completion_grace_seconds": 15,
-        "idle_timeout_seconds": 180,
+        "idle_timeout_seconds": 3600,
     },
     "notifications": {
-        "desktop": False,
+        "desktop": True,
         "webhook_url": "",
         "telegram_chat_id": "",
         "telegram_bot_token": "",
@@ -3228,7 +3228,7 @@ class DownloadEngine:
 
         # HLS mode: short independent segments survive server resets and
         # resume across runs. The stream is remuxed losslessly to MKV or MP4.
-        if str(self.settings.get("download_mode", "direct")).lower() == "hls":
+        if str(self.settings.get("download_mode", "hls")).lower() == "hls":
             try:
                 os.unlink(part)
             except OSError:
@@ -5044,7 +5044,25 @@ def run_doctor(config: Dict[str, Any], json_output: bool,
     record("curl", bool(curl), "found" if curl else "missing",
            curl or "curl is required for downloads")
 
-    # 2. server URL + token configured
+    # 2. ffmpeg availability (required only for HLS remux mode)
+    dl_mode = str((config.get("download_settings") or {})
+                  .get("download_mode", "hls")).lower()
+    ffmpeg_candidates = [str((config.get("download_settings") or {})
+                             .get("ffmpeg_path") or "").strip()]
+    found_which = shutil.which("ffmpeg")
+    if found_which:
+        ffmpeg_candidates.append(found_which)
+    if os.name == "nt":
+        ffmpeg_candidates.append(r"C:\Program Files\DownloadHelper CoApp\ffmpeg.exe")
+    ffmpeg = next((p for p in ffmpeg_candidates if p and os.path.exists(p)), "")
+    if dl_mode == "hls":
+        record("ffmpeg", bool(ffmpeg), "found" if ffmpeg else "missing",
+               ffmpeg or ("required for download_mode=hls; install with "
+                          "winget install Gyan.FFmpeg or set download_settings.ffmpeg_path"))
+    else:
+        record("ffmpeg", True, "not required", f"download_mode={dl_mode}")
+
+    # 3. server URL + token configured
     server_url = config.get("server_url") or ""
     token = config.get("access_token") or ""
     record("server_url", bool(server_url),
@@ -5054,13 +5072,13 @@ def run_doctor(config: Dict[str, Any], json_output: bool,
            "configured" if token else "missing",
            "hidden" if token else "run: emby_dl login --username <name>")
 
-    # 3. env overrides in effect
+    # 4. env overrides in effect
     env_applied = config.get("_env_applied", [])
     record("env_overrides", True,
            ", ".join(env_applied) if env_applied else "none",
            "EMBY_URL/EMBY_TOKEN/EMBY_USER_ID/EMBY_USERNAME/EMBY_DOWNLOADS_DIR")
 
-    # 4. config file permissions (token secrecy on disk)
+    # 5. config file permissions (token secrecy on disk)
     config_path = config.get("_config_path")
     if config_path:
         try:
@@ -5076,7 +5094,7 @@ def run_doctor(config: Dict[str, Any], json_output: bool,
         record("config_permissions", False, "no config file",
                "run: emby_dl init or emby_dl login to create one")
 
-    # 5. downloads dir writable (created on demand like the rest of the tool)
+    # 6. downloads dir writable (created on demand like the rest of the tool)
     try:
         os.makedirs(downloads_path, exist_ok=True)
         writable = os.access(downloads_path, os.W_OK)
@@ -5085,7 +5103,7 @@ def run_doctor(config: Dict[str, Any], json_output: bool,
     except OSError as exc:
         record("downloads_dir", False, "unwritable", str(exc))
 
-    # 6. free disk space vs configured reserve
+    # 7. free disk space vs configured reserve
     free = shutil.disk_usage(os.path.dirname(downloads_path) or ".").free
     reserve = parse_int(config.get("download_settings", {})
                        .get("disk_reserve_bytes", 2 * 1024 ** 3))
@@ -5093,7 +5111,7 @@ def run_doctor(config: Dict[str, Any], json_output: bool,
            f"{human_bytes(free)} free",
            f"reserve {human_bytes(reserve or 2 * 1024 ** 3)}")
 
-    # 7. dataset consistency
+    # 8. dataset consistency
     dataset = DatasetManager(downloads_path)
     report = dataset.check()
     record("dataset", report["ok"],
@@ -5101,11 +5119,11 @@ def run_doctor(config: Dict[str, Any], json_output: bool,
            else f"{len(report['issues'])} issue(s)",
            "run: emby_dl dataset --check")
 
-    # 8. dataset schema version
+    # 9. dataset schema version
     record("dataset_schema", True, f"v{report['version']}",
            f"tool expects v{SCHEMA_VERSION}")
 
-    # 9. live server (skipped with --offline)
+    # 10. live server (skipped with --offline)
     if network:
         caps = CapsCache(downloads_path).read()
         if caps and not os.environ.get("EMBY_NO_CAPS_CACHE"):
@@ -5134,7 +5152,7 @@ def run_doctor(config: Dict[str, Any], json_output: bool,
                 record("server_reachable", False, "unreachable", str(exc))
                 record("token_valid", False, "unknown", "server unreachable")
 
-    # 10. Telegram Bot integration (if configured)
+    # 11. Telegram Bot integration (if configured)
     bot_token = (config.get("notifications") or {}).get("telegram_bot_token") or ""
     chat_id = (config.get("notifications") or {}).get("telegram_chat_id") or ""
     if bot_token and network:
