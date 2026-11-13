@@ -4,6 +4,7 @@ _emby_dl() {
     local -a commands
     commands=(
         'download:Download episodes'
+        'queue:Manage and run multi-series download queues'
         'plan:Resolve selection and show what would download'
         'status:Show live download progress'
         'verify:Verify recorded files against the server'
@@ -42,6 +43,20 @@ _emby_dl() {
                         '--notify[Desktop notification when done]' \
                         '--webhook[POST completion webhook]:url:' \
                         '--json[Machine-readable output]' \
+                        '*:args:'
+                    ;;
+                queue)
+                    _arguments \
+                        '--file[Queue file path]:file:_files' \
+                        '-f[Queue file path]:file:_files' \
+                        '--series-id[Target specific series ID]:id:' \
+                        '--source[Media source index or max]:source:(1 2 3 max)' \
+                        '--include-specials[Include season 0 / specials with all]' \
+                        '--progress[Progress format]:mode:(auto plain json none)' \
+                        '--notify[Desktop notification when done]' \
+                        '--webhook[POST completion webhook]:url:' \
+                        '--json[Machine-readable output]' \
+                        '1:action:(add list run clear remove plan)' \
                         '*:args:'
                     ;;
                 plan)

@@ -3,7 +3,7 @@ _emby_dl_completions() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="download plan status verify watch dataset search list config auth login doctor init"
+    local commands="download queue plan status verify watch dataset search list config auth login doctor init"
     local global_opts="--config -c --downloads-dir --json --version -h --help"
 
     local cmd=""
@@ -46,10 +46,13 @@ _emby_dl_completions() {
 
     case "$cmd" in
         download)
-            COMPREPLY=($(compgen -W "--series-id --source --include-specials --progress --notify --webhook --json" -- "$cur"))
+            COMPREPLY=($(compgen -W "--file -f --series --series-id --source --include-specials --progress --notify --webhook --json" -- "$cur"))
+            ;;
+        queue)
+            COMPREPLY=($(compgen -W "add list run clear remove plan --file -f --series-id --source --include-specials --progress --notify --webhook --json" -- "$cur"))
             ;;
         plan)
-            COMPREPLY=($(compgen -W "--series-id --source --include-specials --json" -- "$cur"))
+            COMPREPLY=($(compgen -W "--file -f --series --series-id --source --include-specials --json" -- "$cur"))
             ;;
         status)
             COMPREPLY=($(compgen -W "--json" -- "$cur"))

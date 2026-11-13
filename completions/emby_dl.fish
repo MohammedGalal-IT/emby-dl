@@ -33,6 +33,7 @@ for c in emby_dl emby-dl
 
     # Commands
     complete -c $c -n "__fish_emby_dl_needs_command" -a download -d "Download episodes"
+    complete -c $c -n "__fish_emby_dl_needs_command" -a queue -d "Manage and run multi-series queues"
     complete -c $c -n "__fish_emby_dl_needs_command" -a plan -d "Resolve selection and show plan"
     complete -c $c -n "__fish_emby_dl_needs_command" -a status -d "Show live download progress"
     complete -c $c -n "__fish_emby_dl_needs_command" -a verify -d "Verify recorded files against server"
@@ -54,6 +55,17 @@ for c in emby_dl emby-dl
     complete -c $c -n "__fish_emby_dl_using_subcommand download" -l notify -d "Desktop notification"
     complete -c $c -n "__fish_emby_dl_using_subcommand download" -l webhook -r -d "Webhook URL"
     complete -c $c -n "__fish_emby_dl_using_subcommand download" -l json
+
+    # Options for queue
+    complete -c $c -n "__fish_emby_dl_using_subcommand queue" -a "add list run clear remove plan" -d "Queue action"
+    complete -c $c -n "__fish_emby_dl_using_subcommand queue" -l file -s f -r -d "Queue file path"
+    complete -c $c -n "__fish_emby_dl_using_subcommand queue" -l series-id -r -d "Target series ID"
+    complete -c $c -n "__fish_emby_dl_using_subcommand queue" -l source -r -a "1 2 3 max" -d "Media source"
+    complete -c $c -n "__fish_emby_dl_using_subcommand queue" -l include-specials -d "Include season 0 with all"
+    complete -c $c -n "__fish_emby_dl_using_subcommand queue" -l progress -r -a "auto plain json none"
+    complete -c $c -n "__fish_emby_dl_using_subcommand queue" -l notify -d "Desktop notification"
+    complete -c $c -n "__fish_emby_dl_using_subcommand queue" -l webhook -r -d "Webhook URL"
+    complete -c $c -n "__fish_emby_dl_using_subcommand queue" -l json
 
     # Options for dataset
     complete -c $c -n "__fish_emby_dl_using_subcommand dataset" -l stats -d "Statistics"

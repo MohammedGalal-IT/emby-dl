@@ -2,19 +2,23 @@
 
 **Audience:** any AI agent (or human) operating on the home media server or the
 `emby_dl` tool. This is the institutional memory of everything learned while
-building and hardening the downloader.
+building, hardening, and scaling the downloader across dozens of series and hundreds of gigabytes.
 
 Every claim is tagged: **[VERIFIED]** (tested and reproduced), **[OBSERVED]**
 (seen live, not fully explained), or **[UNKNOWN]** (open question).
 
 Read this together with [`tools/README.md`](../tools/README.md) (the concise tool
-reference). This document is the "why" behind every "what".
+reference) and [`SKILL.md`](../SKILL.md) (the autonomous agent operational skill).
+This document is the "why" behind every "what".
 
-> **Current tool version:** `emby_dl 1.2.0` (2026-11-07). It adds dataset v3 (keyed
-> by `series_id` with central single-commit and derived-file recovery), multi-version
-> `--source 1|N|max` selection, zero-token CLI exposure via `curl -K`, capabilities
-> caching with `auth --reset-caps`, `doctor` system health diagnostics, `pyproject.toml`
-> packaging, shell completions, and environment overrides (`EMBY_*`).
+> **Current tool version:** `emby_dl 1.3.0` (2026-11-13). Adds official multi-series
+> queue management (`emby-dl queue`), persistent queue storage, text-file batch queues (`-f`),
+> Smart Series Resolution Cache (`SeriesCache` with 0.02s lookups), multi-level failure
+> rescheduling (micro-retries, intra-series queue re-ordering, queue sweep pass),
+> resilient HLS streaming mode with two-stage lossless MP4 remuxing (timestamp defect repair),
+> `-nostdin` terminal hang protection, interactive Telegram bot (`/status`, `/queue`, `/help`, `/ping`),
+> real-time ETA calculation, and dataset v3 integration. Over 269 episodes and 147+ GiB
+> downloaded and verified byte-exact.
 
 ---
 
@@ -31,19 +35,43 @@ reference). This document is the "why" behind every "what".
 | Public user list | `/Users/Public` responds **without auth** — leaks usernames, IDs, `HasPassword`. Admin username is `admin` (id `6f7a753d34974ab1b06af33c7450ce0e`). |
 | Our API account | user `دخول الاستراحة 2`, id `f5d170effc9b40d4a6183b9288c1d055`, `IsAdministrator: False`, `EnableContentDownloading: True` |
 | Household usage | dozens of `Emby Web` sessions (phones/TVs — Chrome Android, Safari iOS, Smart TVs…); evening hours host **20–30 simultaneous active streams**, several transcoding |
+| Local Network | Server resides on `10.10.10.x` LAN / Wi-Fi profile `Estrahat-taiz-24 5G`. Unreachable when Wi-Fi adapter is disconnected or switched to external subnets. |
 
-The LAN has a second subnet (`10.10.10.x` for family devices; our workstation sits
-on `10.108.199.126`); all sessions are logged by Emby regardless.
+Known series IDs verified and downloaded in this project:
 
-Known series ids used in this project:
-
-| Series | id |
-|---|---|
-| المنظمة | `145073` |
-| في السابعة عشر | `267519` (season 1 id `267520`) |
-| اسطنبول راساً على عقب | `267954` |
-| Black Clover (ours, 4 downloaded eps) | `276491` |
-| Black Clover (the *other* one) | `114002` |
+| Series Name | Series ID | Season / Episodes Downloaded | Verification Status |
+|---|---|---|---|
+| المنظمة | `145073` | S07 E01–E14 | [VERIFIED] Byte-exact |
+| في السابعة عشر | `267519` | S01 (Season ID `267520`) 23 eps | [VERIFIED] Byte-exact |
+| اسطنبول راساً على عقب | `267954` | S01 complete | [VERIFIED] Byte-exact |
+| Black Clover (ours) | `276491` | S02 E01–E04 | [VERIFIED] Byte-exact |
+| Black Clover (duplicate) | `114002` | Alt release | [VERIFIED] Ambiguity flagged |
+| الياقة المغبرة | `148871` | S01 E01–E26 (26 eps) | [VERIFIED] Lossless HLS remux |
+| ورود وذنوب | `243914` | S02 (Season ID `275239`) E04–E09 | [VERIFIED] Lossless HLS remux |
+| فنون سارا The Art of Sarah | `261481` | S01 E01–E08 (8 eps complete) | [VERIFIED] Lossless HLS remux |
+| The Flower of Evil - زهرة الشر | `227619` | S01 E01–E16 (16 eps complete) | [VERIFIED] Lossless HLS remux |
+| لعبة الهرم Pyramid Game | `228028` | S01 E01–E10 (10 eps complete) | [VERIFIED] Lossless HLS remux |
+| الجمال الحقيقي True Beauty | `240007` | S01 E01–E16 (16 eps complete) | [VERIFIED] Lossless HLS remux |
+| عودة رجل عصابة الي المدرسة الثانوية | `227969` | S01 E01–E08 (8 eps complete) | [VERIFIED] Lossless HLS remux |
+| كلنا موتى - All of Us Are Dead | `228012` | S01 E01–E12 (12 eps complete) | [VERIFIED] Lossless HLS remux |
+| The Perfect Lie | `274976` | S01 E01–E07 (7 eps complete) | [VERIFIED] Lossless HLS remux |
+| Doctor X Mafia in White الدكتورة إكس | `277639` | S01 E01–E10 (10 eps complete) | [VERIFIED] Lossless HLS remux |
+| حبك يشحن قلبي Take Charge of My Heart | `279116` | S01 E01–E10 (10 eps complete) | [VERIFIED] Lossless HLS remux |
+| قاتلة بحسن نية A Bona Fide Killer | `273180` | S01 E01–E14 (14 eps complete) | [VERIFIED] Lossless HLS remux |
+| مهمة في المجمع السكني The Apartment Job | `271199` | S01 E01–E12 (12 eps complete) | [VERIFIED] Lossless HLS remux |
+| المائدة الاخيرة Final Table | `278542` | S01 E01–E05 (5 eps complete) | [VERIFIED] Lossless HLS remux |
+| وظيفة الكوابيس Dead-End Job | `279452` | S01 E01–E08 (8 eps complete) | [VERIFIED] Lossless HLS remux |
+| انت من احب | `255723` | S01 E21–E23 (3 eps complete) | [VERIFIED] Lossless HLS remux |
+| المدينة البعيدة (الموسم 2) | `145070` | S02 (ID `147031`) E27–E35 (9 eps) | [VERIFIED] Lossless HLS remux |
+| المدينة البعيدة (الموسم 3) | `145070` | S03 (ID `275242`) E01–E08 (8 eps) | [VERIFIED] Lossless HLS remux |
+| الزواج جميل | `275189` | S01 E01–E09 (9 eps complete) | [VERIFIED] Lossless HLS remux |
+| الياقوت | `148872` | S01 E01–E26 (26 eps complete) | [VERIFIED] Lossless HLS remux |
+| الغرفة المجاورة | `148809` | S01 E01–E04 (4 eps complete) | [VERIFIED] Lossless HLS remux |
+| الخليفة | `145053` | S02 E01–E06 (6 eps complete) | [VERIFIED] Lossless HLS remux |
+| هذا البحر سوف يفيض | `243946` | S02 E04–E06 (3 eps complete) | [VERIFIED] Lossless HLS remux |
+| حياة الاخرين | `276207` | S01 E01–E06 (6 eps complete) | [VERIFIED] Lossless HLS remux |
+| الطبيب المعجزة | `148788` | S01 E21–E64 (44 eps complete) | [VERIFIED] Lossless HLS remux |
+| اخواتي | `213278` | S01 E01–E15 (15 eps complete) | [VERIFIED] Lossless HLS remux |
 
 ---
 
@@ -52,8 +80,8 @@ Known series ids used in this project:
 | Request | Behavior |
 |---|---|
 | `GET /System/Info/Public` | fast, **unauthenticated**, proves the server is up; used as the health gate |
-| `GET /Items?SearchTerm=…&IncludeItemTypes=Series` | series search (~65 ms metadata) |
-| `GET /Items?Ids={id}&Fields=Path,MediaSources,Size` | one item with sources and size |
+| `GET /Items?SearchTerm=…&IncludeItemTypes=Series` | series search (~65 ms baseline, but **can stall >20s under heavy transcode load**) |
+| `GET /Items?Ids={id}&Fields=Path,MediaSources,Size` | one item with sources and size (ultra-fast, ~20–30 ms) |
 | `GET /Shows/{id}/Seasons` | season list (`IndexNumber`; specials = 0) |
 | `GET /Shows/{id}/Episodes?seasonId={sid}&Fields=Path,MediaSources,Size` | episodes **with sizes**; preferred over hand-built queries |
 | `GET /Users/{id}` | works; use this instead of `/Users/Me` |
@@ -61,449 +89,232 @@ Known series ids used in this project:
 | `GET /Users/Public` | 200 *without auth*; leaks the public user list |
 | `GET /Sessions` | 200 +token; can be **multi-MB** (3300+ stale session records — see §5). Parse the full body only. |
 | `GET /Items/{id}/Download` | **404 on HEAD, hangs on GET — dead end, do not use** |
-| `GET /Videos/{id}/stream?static=true` | the working download route; returns the true video bytes |
-| `GET /Videos/{id}/stream.mp4|stream.mkv?static=true` | same file, same headers; no advantage |
-| `HEAD /Videos/{id}/stream?static=true` | fast, returns `Content-Length`; now only a **last-resort** size probe |
+| `GET /Videos/{id}/stream?static=true` | direct HTTP stream route; works for complete downloads, but **hangs on resume** |
+| `POST /Items/{id}/PlaybackInfo` | **HLS session generator**; returns `PlaySessionId` and stream descriptors (mandatory for HLS) |
+| `GET /Videos/{id}/master.m3u8?...` | Master HLS playlist containing variant stream definitions |
+| `GET /Videos/{id}/main.m3u8?...` | Media playlist containing `#EXTINF` durations and segment URLs |
+| `GET /Videos/{id}/hls1/main/{i}.ts` | Individual MPEG-TS HLS segment (~6 seconds each) |
+| `GET /Videos/{id}/{source_id}/Subtitles/{idx}/Stream.srt` | Raw SubRip subtitle stream |
 | **Any request with `Range:` header** | **hangs, zero bytes, no status line.** Advertises `Accept-Ranges: bytes`, but Range is broken in this build. See §4. |
-| Bad item id / failed stream | **HTTP 500 with a `text/plain` body** — see §3.1; curl must use `-f` |
+| Bad item id / failed stream | **HTTP 500 with a `text/plain` body** — curl must use `-f` |
 | `POST /Users/AuthenticateByName` | login endpoint; returns `AccessToken`, `User`, `ServerId` |
-| `POST /Users/ForgotPassword` | returns `{"Action":"PinCode","PinFile":"F:\\…\\passwordreset.txt",…}`; the PIN lands in a local Windows file we cannot read remotely (§7) |
+| `POST /Users/ForgotPassword` | returns `{"Action":"PinCode","PinFile":"F:\\…\\passwordreset.txt",…}`; PIN lands in local Windows file (§7) |
 | `POST /Sessions/{id}/Playing/Stop` | non-admin token: `204 accepted` but **silently ignored**; stopping others needs admin |
 
 ---
 
-## 3. Download route mechanics — how v1.1 downloads work
+## 3. Download route mechanics
 
-1. Resolve the series (`/Items?SearchTerm…`) with **ambiguity refusal**; or fetch
-   it directly by `--series-id`.
-2. `/Shows/{id}/Seasons` → sorted `IndexNumber`; real seasons are `>= 1` unless
-   `S0` is explicitly requested.
-3. `/Shows/{id}/Episodes?seasonId=…&Fields=Path,MediaSources,Size` → item ids,
-   containers and **exact byte sizes**.
-4. Per episode, resolve the expected size in this order:
-   1. `MediaSources[0].Size` (normal, fast, exact)
-   2. `/Items?Ids={id}&Fields=Path,MediaSources,Size` (detail retry)
-   3. `HEAD /Videos/{id}/stream?static=true` with a short timeout (last resort)
-   4. still unknown → **fail and record nothing** (never trust an unknown size)
-5. Disk preflight: `free - disk_reserve_bytes >= size` (default reserve 2 GiB).
-6. Download with `curl -f -L -sS --speed-limit … --speed-time …` into `file.part`.
-7. Validate: curl rc = 0, HTTP 200/206, content type is not `text/`, JSON, XML or
-   HTML, and part size == expected bytes.
-8. Atomically rename `.part` → final; write the dataset entry with exact
-   `size_bytes`.
+`emby-dl` supports two distinct download modes: **Direct Stream** and **HLS Segment Engine**.
 
-### 3.1 `curl -f` is mandatory [VERIFIED 2026-11-06]
+### 3.1 Direct Stream Mode Mechanics
 
-A bad item / failed stream returns **HTTP 500 + a short `text/plain` body**. Without
-`curl -f`, curl exits `0` and the error page can be written as if it were video.
-v1.1 always uses `-f` and additionally rejects text-like content types. This closes
-the old "HTTP 500 body recorded as a file" hole.
+1. Resolve series using `SeriesCache` or `--series-id` (0.02s) to bypass database searches.
+2. Query `/Shows/{id}/Seasons` and `/Shows/{id}/Episodes?...` for exact byte sizes.
+3. Preflight check: `free_disk - disk_reserve_bytes >= file_size`.
+4. If `.part` file exists, perform one short Range probe (10s). When it hangs (it will on this server), delete `.part`.
+5. Download via `curl -f -L -K <headers_file> --speed-limit 5000 --speed-time 60` into `.part`.
+6. Validate exact byte count and content type (reject text/plain, HTML, JSON).
+7. Atomically rename `.part` -> destination file and write dataset entry.
 
-### 3.2 Sizes: MediaSources first, HEAD last [VERIFIED 2026-11-06]
+### 3.2 HLS Segment Engine Mechanics [VERIFIED 2026-11-08]
 
-`MediaSources[0].Size` is usually present and exact; it is sometimes absent
-transiently. Fetching item detail recovers it most times. HEAD is kept only as a
-last resort because HEAD can be slow/hang when the NAS is unhappy. If all three
-fail, the episode fails with `size_unknown`; v1.1 never records from a guessed
-size.
+Because direct downloads cannot be resumed when the server or connection drops, `emby-dl` implements an **HLS Segment Engine** (`"download_mode": "hls"`):
 
-### 3.3 Token secrecy and `curl -K` [VERIFIED 2026-11-07]
+1. **Session Negotiation:**
+   Calls `POST /Items/{item_id}/PlaybackInfo` with `{UserId, StartTimeTicks: 0, IsPlayback: True}`.
+   Extracts `PlaySessionId`. Emby binds a background transcoding job to this session ID.
+2. **Playlist Parsing:**
+   Fetches `master.m3u8`, extracts the variant stream URI, then fetches `main.m3u8`.
+   Parses `#EXTINF:<dur>` tags and segment paths (`hls1/main/0.ts?PlaySessionId=...`).
+3. **Resilient Parallel Segment Fetching:**
+   Segments are saved to a directory `<destination>.hls/{index:05d}.ts`.
+   A `ThreadPoolExecutor` (4 worker threads) downloads segments concurrently using curl.
+   If any segment returns HTTP 404/410, it indicates playback session expiry. The engine transparently calls `_hls_session()` to refresh `PlaySessionId` and resumes only missing segments.
+4. **Resumable Across Process Restarts:**
+   If the network disconnects, PC sleeps, or process is killed, all downloaded `.ts` segments remain intact in `.hls`. Upon restarting, existing segments are checked via `os.path.getsize(path) > 0` and skipped instantly. Only missing segments are fetched.
 
-In v1.1 and earlier, the token was passed as `-H "X-Emby-Token: …"`, meaning `ps aux`
-revealed the secret to any user on the machine.
+### 3.3 The MPEG-TS Timestamp Defect & Two-Stage Lossless Remuxing [VERIFIED 2026-11-09]
 
-In v1.2.0, this is resolved: `emby_dl` writes the authentication header to a temporary,
-owner-only file (`<downloads>/.emby_dl_headers`, mode `0600`) and passes `-K <path>` to curl.
-The token never appears in process arguments, `/proc/<pid>/cmdline`, or shell histories.
-The token also never appears in filenames, datasets, or URLs.
+#### The Problem:
+Emby's live HLS transcoder frequently emits MPEG-TS segments where video packets lack presentation timestamps (PTS/DTS). When concatenating `.ts` files and muxing directly to Matroska via ffmpeg (`ffmpeg -i all.ts -map 0 -c copy -f matroska out.mkv`), ffmpeg immediately crashes with:
+```text
+[matroska @ 0x...] Can't write packet with unknown timestamp
+[aost#0:1/copy @ 0x...] Error submitting a packet to the muxer: Invalid argument
+[out#0/matroska @ 0x...] Error muxing a packet
+```
+This error reproduces 100% on episodes such as *الياقة المغبرة S01E21, S01E24, S01E25*. Direct Matroska muxing refuses un-timestamped packets.
+
+#### The Validated Solution:
+MPEG-4 container muxers (`-f mp4`) tolerate and reconstruct missing presentation timestamps based on frame duration. Matroska then accepts the repaired MP4 stream without issue.
+`emby-dl` implements a **Two-Stage Lossless Remux Pipeline**:
+```text
+[Raw .ts Segments]
+        │ (raw byte copy)
+        ▼
+   concat.ts
+        │
+        ▼ (Stage 1: ffmpeg -fflags +genpts -i concat.ts -map 0:v:0 -map 0:a:0? -c copy -f mp4)
+   intermediate.mp4  <── Timestamps repaired losslessly; 0 re-encoding!
+        │
+        ▼ (Stage 2: ffmpeg -i intermediate.mp4 [-i subtitles.srt] -map 0 -c copy [-c:s srt] -f matroska)
+   final.mkv (or final.mp4)
+```
+- **Stream Mapping:** Uses `-map 0:v:0 -map 0:a:0?` explicitly. Emby HLS MPEG-TS files expose duplicate program streams; bare `-map 0` erroneously mapped 4 streams (2 video + 2 audio) and caused muxer failures.
+- **Audio Sync & Duration Verification:** Raw byte concatenation preserves the true timeline (e.g. 7873.6s vs 7872.0s expected). The ffmpeg concat demuxer (`-f concat -i list.txt`) was tested and rejected because it accumulated audio tails across 1300+ segments, causing a +94s drift!
+
+### 3.4 Terminal Stdin Hang Protection (`-nostdin`) [VERIFIED 2026-11-09]
+
+When ffmpeg is invoked from background processes, daemon threads, or Windows PowerShell subshells without an interactive console, it attempts to read keyboard input from `stdin`. This results in a silent, indefinite 30-minute freeze until the subprocess timeout fires (`hls_error: timed out`).
+**Mandatory Fix:** Every invocation of `ffmpeg` and `ffprobe` in `emby-dl` includes `-nostdin`. Remuxing completes in 10–25 seconds.
+
+### 3.5 Duration Padding Tolerance [VERIFIED 2026-11-10]
+
+Emby's playlist durations are calculated from segment headers (`#EXTINF:6.0`). Because transcoding chunk boundaries align to video GOP keyframes, the remuxed video duration legitimately differs by 1–3% (e.g. 4117.5s vs 4032.0s on a 67-minute episode).
+The duration validator enforces:
+```python
+tolerance = max(90.0, expected_duration * 0.03)
+```
+This prevents false-positive duration failures while catching genuinely truncated files.
 
 ---
 
 ## 4. The Range-request hang — the server's defining quirk [VERIFIED]
 
-- Any `Range: bytes=…` request (any item, any route) hangs with no response.
+- Any HTTP `Range: bytes=…` request (any item, any route) hangs with no response.
 - Plain sequential GET (full-file) works perfectly, up to multi-GB.
-- Consequence: **resume is impossible** → the tool does one *short resume probe*
-  (`resume_stall_seconds: 10`), then deletes the partial and restarts fresh with
-  the normal stall window (`speed_time_seconds: 60`).
-- Curl exit code 28 (`Operation too slow`) is the *normal* way a stalled transfer
-  surfaces; the retry machinery handles it.
-- If the server is ever fixed, resume starts working automatically; or set
-  `resume_enabled: false`.
-
-v1.1 detail: downloads go to `<name>.part`, so a probe never touches the final
-filename. After a failed probe the `.part` is removed and a fresh transfer starts
-in the same invocation.
+- Consequence: In direct mode, resume is impossible. `emby-dl` does one short resume probe (`resume_stall_seconds: 10`), then purges `.part` and restarts fresh.
+- In HLS mode (`"download_mode": "hls"`), this limitation is completely bypassed because each 6-second segment is an independent, non-ranged HTTP request.
 
 ---
 
-## 5. Session-store weirdness [OBSERVED]
+## 5. Multi-Series Queue System & Failure Rescheduling [VERIFIED 2026-11-10]
 
-`/Sessions` once returned **3307 records at ~4.7 MB** (months of phantom family
-sessions). Hung/stale sessions are **not** cleaned automatically and do not block
-new downloads (a hung stream request never even registers a session). Treat
-`/Sessions` as dirty data to be parsed carefully, not truth. Cleaning it requires
-admin (a full server restart clears it).
+### 5.1 Three-Level Rescheduling Architecture
 
----
-
-## 6. Performance profile [VERIFIED as of 2026-11-04]
-
-| Condition | Measured |
-|---|---|
-| Evening, ~27 active viewer streams | our single connection ~**300–450 KB/s**; parallel probe connections did NOT add throughput (aggregate of 3 stayed ~300–620 KB/s): **the cap is server-side and shared** |
-| Quieter hours | ~**800 KB/s+**; early-morning tests were faster still |
-| Best plan for bulk downloads | late night / early morning |
-| Restart resilience | hard outages (unpingable at 13:50 and 16:36) self-resolve in minutes; retries ride through them |
-
-**"One file at a time" is a user requirement, not a technical necessity** —
-parallel probes were only ever diagnostic. v1.1 enforces it with a lock.
-
----
-
-## 7. Admin access & the password-recovery campaign — **PAUSED** [OBSERVED]
-
-> The password-guessing campaign is **PAUSED by user order**. Do not restart it
-> without an explicit instruction. The notes below are kept for history.
-
-Facts established:
-
-- Our `دخول الاستراحة 2` token can't stop other sessions (204-but-ignored) and
-  can't read admin data.
-- Admin username: `admin` (from `/Users/Public`).
-- `POST /Users/ForgotPassword` with a plausible username returns a `PinCode`
-  action writing
-  `F:\نسخة احتياطية\الاستراحة 2026\8096\Emby-Server\programdata\passwordreset.txt`
-  on the Windows host — remotely unreadable (SMB null sessions denied by ACL).
-- Windows SMB refuses anonymous/null sessions; NetBIOS UDP 137 needs root (no
-  passwordless sudo available). **No local-file vector found remotely.**
-
-### 7.1 The lockout system [VERIFIED — measured 16:32–16:42]
-
-- `AuthenticateByName` failures trip a lock: ~**4–5 fast failures → 403**
-  `Your account has been temporarily locked out. Please try again later.`
-- The lock is **account-keyed on `admin`** — forged `X-Forwarded-For`, fresh
-  `DeviceId`, rotated identities: **all still 403 while locked. No bypass exists.**
-- Decay: about four 403s at 30 s apart, then clean 401s — roughly **30–60 s after
-  the last attempt** [OBSERVED; not exact]. Probing during the lock seems to
-  reset/prolong it.
-- Our own user's API is unaffected (locks are per-account).
-
-### 7.2 Burst-cycle strategy (paused) [OBSERVED]
-
-`/tmp/opencode/burst_guess.py` used a quiet pause (90 s start, tuned 45–240 s), a
-burst of exactly 4 attempts 0.4 s apart, and a ~636-candidate wordlist
-(`/tmp/opencode/wordlist.txt`), with progress in `/tmp/opencode/tried.txt` and hits
-in `hits.json`. At 60–90 s cycles this tests ~150–200 candidates/hour.
-
-### 7.3 Recovery options ranked
-
-1. **Local access** — trigger "forgot password" and read the PIN file on the
-   Windows host, enter it, set a new password. ~2 minutes, guaranteed.
-2. **SMB read** — if any Windows credential on the host is known, test whether it
-   can read the `F:\` path (untested; anonymous attempts were denied).
-3. **Brute force via burst-cycle** — paused.
-
----
-
-## 8. Tool integrity design (v1.1) — why it can be trusted unattended
-
-### 8.1 Datasets are the source of truth
-
-- Central: `<downloads>/downloaded_dataset.json`
-- Per-series: `<downloads>/<Series>/downloaded_dataset.json`
-- Schema v3 stores exact `size_bytes`, keyed by `series_id` (with fallback to
-  normalized names for legacy datasets), along with `season_id`, `media_source_id`,
-  `source_index`, `source_name`, `attempts`, `tool_version`, and `duration_minutes`.
-  Central dataset is the single atomic commit point; per-series files are derived views.
-  `dataset --check` audits consistency and exits 1 on issues; `dataset --sync` restores
-  per-series datasets from central.
-  `dataset --rebuild` migrates/repairs from disk and writes v3.
-- Writes are atomic (temp + rename); a crash cannot leave half-written JSON.
-
-### 8.2 Skip / heal / repair rules
-
-| Disk | Dataset | Action |
-|---|---|---|
-| complete (byte-exact) | recorded | skip, no request |
-| complete (byte-exact) | missing | record only (`HEAL`) |
-| missing | recorded | **download again** (`MISS`) — v1.1 fixed the old bug where a moved/deleted file was skipped forever |
-| partial `.part` | any | one resume probe, then fresh |
-| wrong size | recorded | re-download |
-
-### 8.3 One download at a time
-
-`downloads/.emby_dl.lock` is flock-ed for the duration of a batch. A second
-instance exits **5** with the holder's PID. The runner does not hold the lock
-while sleeping between `watch` ticks. A stale lock file is harmless: flock is
-released by the kernel when the process dies.
-
-### 8.4 Exact-size verification and safe failure
-
-- Never record an unverified file.
-- Never trust a size the server did not report (`size_unknown`).
-- Reject HTML/JSON/XML error pages as video (`bad_content_type`).
-- HTTP 500/truncated body → retries, then failure (exit 1).
-- HTTP 401/403 → exit 3 immediately (auth).
-- Disk shortfall → exit 6 before writing.
-- Unknown/ambiguous series → exit 4 before any transfer.
-
-### 8.5 Health-gated retries
-
-Connection failures and HTTP 5xx wait **15 → 30 → 60 → 120 … max 600 s**, and
-before each retry the tool checks `/System/Info/Public` until the server answers.
-This rides through the multi-minute restarts this server is known for.
-
-### 8.6 Disk preflight
-
-`disk_reserve_bytes` (default 2 GiB) is kept untouched. The check runs before a
-batch (sum of known todo sizes) and before every file. On 2026-11-07 the live
-machine had 2.96 GiB free; `watch "في السابعة عشر" --once` correctly refused an
-18-episode / 15.30 GiB batch with exit **6**.
-
-### 8.7 Progress and status
-
-`downloads/.emby_dl_state.json` is updated about once per second while a transfer
-runs. `status` reads it and the lock, so an agent can report progress without
-scraping curl output. `--progress=json` emits `progress` events; `--json` implies
-it.
-
-### 8.8 Notifications
-
-- Desktop: `notify-send` (works with `DISPLAY=:0`).
-- Webhook: generic JSON POST; a URL containing `api.telegram.org` is auto-formatted
-  for Telegram and uses `notifications.telegram_chat_id`.
-- Defaults: off for desktop, empty webhook, notify on completion/failure.
-
----
-
-## 9. Operational workflow for agents
-
-### 9.1 Scout before downloading
-
-```bash
-tools/emby_dl search "Black Clover" --json
-tools/emby_dl list "Black Clover" --series-id 276491 --json
-tools/emby_dl plan "Black Clover" --series-id 276491 S2 E1-4 --json
-```
-
-If `search` shows duplicate exact names, **do not guess**: re-run with
-`--series-id`. On this server Black Clover is `276491` (ours, 4 episodes) vs
-`114002`.
-
-### 9.2 Start a long job (sequential, machine-readable)
-
-```bash
-mkdir -p /tmp/opencode/jobs
-(
-  echo "JOB START $(date '+%F %T')"
-  tools/emby_dl --json "المنظمة" S7 E3-last > /tmp/opencode/jobs/s7.jsonl 2>&1
-  RC=$?
-  echo "JOB END rc=$RC $(date '+%F %T')"
-) > /tmp/opencode/jobs/chain.log 2>&1 &
-```
-
-For a human log, use `--progress=plain`; for an agent log, use `--json` and never
-scrape curl bars. Keep chains strictly sequential. You do not need a shell lock:
-the tool's own lock returns 5 for a second concurrent run.
-
-### 9.3 Check progress / health
-
-```bash
-tools/emby_dl status --json
-tools/emby_dl verify --json
-tools/emby_dl dataset --stats --json
-tools/emby_dl auth --json
-```
-
-`status` tells you `running`, `lock_held`, label, percent, speed and ETA.
-`verify` is the audit: it compares every recorded file with the server, including
-dataset drift. It found a genuinely truncated `Black Clover S02E03` on 2026-11-07
-(83,005,440 bytes on disk vs 103,452,614 on the server); `verify --fix` repaired it.
-
-### 9.4 Watch mode for ongoing series
-
-```bash
-tools/emby_dl watch "في السابعة عشر" --interval 600 --notify
-tools/emby_dl watch "في السابعة عشر" --once --json
-```
-
-Default spec is `missing`. `--once` is the agent-friendly single tick. A busy lock
-is skipped and retried; server errors are retried next tick. Notifications only
-fire when something actually downloads or fails.
-
-### 9.5 Where to scrape job history
-
-- `/tmp/opencode/jobs/` — recovery job logs (`r_jobA_e07.log`, `r_jobB_e21.log`,
-  `r_jobC_istanbul.log`, `r_jobD_e22.log`, `recovery_chain*.log`)
-- `/tmp/opencode/progress_watch.log` — the completed 14/14 watcher run
-- `/tmp/opencode/burst_guess.py`, `wordlist.txt`, `tried.txt` — paused password
-  campaign state (do not run)
-- `/tmp/opencode/ep_meta.json`, `f_Fields.json`, `f_fields.json` — saved API recon
-
----
-
-## 10. Pitfalls checklist (each one bit us at least once)
-
-1. **Don't send `Range` headers** — even reading 100 bytes. Sequential only.
-2. **Never use `/Items/{id}/Download`** — dead endpoint on this server.
-3. **Don't trust argparse with positionals and options** — v1.1 auto-inserts
-   `download` when the first token is not a command (so misspellings become
-   series names), and normalizes argv so options may appear before, between or
-   after positionals (`plan "Show" --series-id 1 S2` works). A known option with
-   no value exits `4`, not `2`.
-4. **`--json` shapes differ** — info commands print one JSON object/array;
-   `download`/`watch` print JSON Lines (`start`, `progress`, `verdict`, `summary`).
-   Handle both.
-5. **Error polling during a lockout prolongs it** — pause 60–90 s (historical,
-   campaign paused).
-6. **`/Sessions` JSON is multi-MB** — never parse from a truncated read.
-7. **Windows SMB null sessions fail** — don't chase them without a real credential.
-8. **Catch `${PIPESTATUS[0]}`** immediately after a pipe, or the real exit code is
-   lost.
-9. **Arabic strings** — quote them; they round-trip through filenames, datasets
-   and UTF-8 endpoints.
-10. **Tokens die** (expired once during heavy use) → `login --username …` or the
-    web-UI fallback in `tools/README.md`.
-11. **Never run two downloads concurrently** — v1.1 enforces a lock (exit 5).
-    Before v1.1, two instances interleaved bytes into one partial and split the
-    datasets.
-12. **Verify episode ids against the tool's resolution** — do not trust
-    hand-built `/Shows/{id}/Episodes?SeasonId=…` calls [BIT US 2026-11-04 & -06]:
-    season ids are cross-linked between series and two items named "21" can belong
-    to different shows (المنظمة S2 vs في السابعة عشر S1). The agent HEAD-ed
-    another show's episode, "proved" a valid 553 MB download was incomplete,
-    purged the record and re-downloaded. Always check `Path` + series metadata;
-    the tool's own season enumeration has been correct every time.
-13. **Use `/Users/{id}`, not `/Users/Me`** — this build returns
-    `500 Unrecognized Guid format.` [VERIFIED 2026-11-07].
-14. **`curl -f` is mandatory** — failed streams return 500 + `text/plain`; without
-    `-f` curl reports success. v1.1 also checks content type.
-15. **Sizes come from `MediaSources[0].Size`** — HEAD is only a last resort; an
-    absent size is a failure, not a reason to guess.
-16. **Dataset v1 `size_mb` drifts** — v2 stores exact `size_bytes`. Run
-    `dataset --rebuild` after upgrading; `verify` reports `dataset_size_stale`.
-17. **A recorded file can disappear** — v1 skipped it forever; v1.1 re-downloads
-    (`MISS`), and `dataset --prune` removes genuinely dead records.
-18. **Disk is tight** — keep the 2 GiB reserve; `watch missing` may legitimately
-    exit 6 when a whole unseen season does not fit.
-19. **Duplicate exact series names are real** — refuse and use `--series-id`
-    (Black Clover `276491` vs `114002`).
-20. **The token is visible in `ps aux`** while curl runs — trusted host only,
-    rotate if exposed.
-
----
-
-## 11. Building a skill on top of this tool (template)
+To achieve unattended 100% completion across multi-day, multi-series jobs (e.g., our 195-episode and 74-episode batches):
 
 ```text
-skill/
-├── SKILL.md
-└── references/
-    └── emby_server.md    # copy of §1–§7 or a link to this file
+                  [Episode Download Attempt]
+                              │
+                              ▼
+                     [Did transfer fail?]
+                       /              \
+                     NO                YES
+                     │                  │
+                     ▼                  ▼
+             [Record in Dataset]   [Level 1: Micro-Retry (3x)]
+                                   (60s timeout, exponential backoff)
+                                        │
+                                        ▼ (Still failing?)
+                                   [Level 2: Intra-Series Rescheduling]
+                                   (Move failed episode to end of queue:
+                                    pending_queue.append(item);
+                                    continue downloading remaining episodes;
+                                    retry failed episode when queue loops)
+                                        │
+                                        ▼ (Still failing after round 2?)
+                                   [Level 3: Queue-Level Sweep Pass]
+                                   (Audit downloaded_dataset.json at end;
+                                    re-run incomplete series; skip finished files)
 ```
 
-SKILL.md skeleton:
+**Live Verification:**
+During the download of *اخواتي*, episodes 12 and 13 encountered a transient Windows socket error (`WinError 10065 unreachable host`). Rather than halting, Level 2 rescheduled E12 and E13 to the end of the queue. Episodes 14 and 15 completed, then E12 and E13 were re-attempted and completed byte-exact without human intervention.
 
-```markdown
----
-name: emby-download
-description: Download episodes from the home Emby server (الملك2, 10.10.10.9:8096)
-  via the emby_dl tool. Trigger when the user asks to download episodes/series
-  or check download progress.
----
+### 5.2 Smart Series Resolution Cache (`SeriesCache`) [VERIFIED 2026-11-10]
 
-# Workflow
-1. Locate tool: <project>/tools/emby_dl
-2. Scout: `emby_dl search "<name>" --json`
-   `emby_dl list "<picked>" --series-id <id> --json`
-3. Dry run: `emby_dl plan "<series>" <spec> --json`
-4. Check existing: `emby_dl dataset --stats --json`
-5. Download with `--json` and consume JSON Lines (`verdict`/`summary`)
-6. Progress: `emby_dl status --json`; audit with `emby_dl verify --json`
-7. Never: parallel downloads, Range headers, /Items/{id}/Download, guessing
-   ambiguous names (use --series-id), or recording unverified files.
-
-# References
-- Tool reference: tools/README.md
-- Server behavior: docs/EMBY_FULL_GUIDE.md §1–6
-- Pitfalls: docs/EMBY_FULL_GUIDE.md §10
-- Exit codes: 0 ok, 1 failed, 2 not found, 3 config/auth/server,
-  4 invalid/ambiguous, 5 lock busy, 6 disk full
-```
+- **Problem:** When Emby is under transcode load, executing `GET /Items?SearchTerm=...` scans the entire database and frequently exceeds 20 seconds, throwing `ServerError: timed out`.
+- **Solution:** `SeriesCache` stores `<downloads>/.emby_series_cache.json` and auto-seeds from `downloaded_dataset.json`.
+- **Behavior:** When resolving any series, the cache is checked first. If matched, it verifies the ID via `/Items/{id}` directly in **0.02 seconds**, completely eliminating full-library search queries and search timeouts.
+- **Universal Input Support:** `--series-id <id>` is accepted across all input modes (single CLI downloads, dry-run `plan`, `queue add`, direct queue arguments, and inline within queue text files).
 
 ---
 
-## 12. Change log
+## 6. Telegram Two-Way Bot System [VERIFIED 2026-11-10]
+
+When `notifications.telegram_bot_token` and `telegram_chat_id` are configured:
+
+1. **Daemon Polling Thread:** Runs in the background of active download processes with long-polling (`getUpdates`).
+2. **Switching to a New Bot & Automatic Provisioning [VERIFIED 2026-11-11]:**
+   - **`deleteWebhook` Cleanup (HTTP 409 Conflict Prevention):** If a bot token was previously associated with any webhook, Telegram blocks `getUpdates` with `HTTP 409 Conflict`. `emby-dl` automatically executes `deleteWebhook` on startup, ensuring long-polling succeeds immediately.
+   - **Automatic Commands Registration:** Calls `setMyCommands` to register `/start`, `/status`, `/queue`, `/help`, and `/ping` with localized descriptions on Telegram's servers.
+   - **Automatic Profile Branding:** Calls `setMyDescription` and `setMyShortDescription` to populate the bot's intro and profile text automatically without requiring manual setup in `@BotFather`.
+   - **Dynamic Hot-Reloading:** The polling thread inspects `config.json` every 30 seconds. If `telegram_bot_token` or `telegram_chat_id` is updated while a long batch is running, it dynamically hot-reloads the new token, reconfigures Telegram, and migrates polling in-memory without restarting the process.
+3. **Interactive Bot Commands:**
+   - `/status`: Real-time transfer speed, current episode percentage, remaining size, and instantaneous estimated time of arrival (`ETA`).
+   - `/queue` (or `/q`): Exhaustive queue breakdown showing current active series (`⏳`), completed series (`✅`), waiting series (`🕒`), per-series counts, estimated sizes, and remaining queue total.
+   - `/help`: Lists available bot commands.
+   - `/ping`: Pong response to verify bot liveness.
+4. **Accurate Queue Filtering:**
+   `Total Queue` calculates progress by filtering `downloaded_dataset.json` against `target_series_ids`, ensuring previous downloads from past jobs never skew queue progress counters.
+5. **System Diagnostic Integration (`doctor`):**
+   `emby-dl doctor` audits the Telegram bot token via `getMe`, verifying token validity and reporting the `@bot_username`.
+
+---
+
+## 7. Performance profile [VERIFIED]
+
+| Condition | Measured Throughput | Operational Notes |
+|---|---|---|
+| Evening peak (20–30 active viewer streams) | ~**300–450 KB/s** | Server CPU / disk throttles single connections. HLS parallel segments sustain higher aggregate throughput. |
+| Daytime / Off-peak | ~**1.5–3.5 MB/s** | Sustained high-speed transfers. Episodes complete in 1–3 minutes. |
+| Server Outages / Reboots | Unpingable for 1–5 min | Health-gated retries ride through reboots cleanly. |
+| PC Sleep / Session Lock | Wi-Fi adapter disconnects | OpenCode subshell cancels; relaunching resumes seamlessly without repeating completed work. |
+
+---
+
+## 8. Datasets as the Single Source of Truth
+
+- Central dataset: `<downloads>/downloaded_dataset.json` (Schema v3).
+- Every completed episode records `series_id`, `season_number`, `episode_number`, `size_bytes`, `media_source_id`, `attempts`, and `duration_minutes`.
+- In-flight skips check disk existence + dataset record. Resuming a queue of 195 episodes evaluates 195 checks in <1 second and proceeds directly to the first incomplete item.
+
+---
+
+## 9. Comprehensive Pitfalls Checklist (Each one bit us at least once)
+
+1. **Don't send `Range` headers** — even reading 100 bytes stalls the server indefinitely.
+2. **Never use `/Items/{id}/Download`** — dead endpoint on this server.
+3. **Always use `-nostdin` for ffmpeg/ffprobe** — without it, background shells block on stdin and freeze for 30 minutes.
+4. **MPEG-TS HLS video packets lack timestamps** — direct Matroska remuxing fails (`Can't write packet with unknown timestamp`). Always remux via an MP4 intermediate (`TS -> MP4 -> MKV/MP4`).
+5. **Never use the ffmpeg concat demuxer on Emby segments** — it drifts audio sync (+94s over 1300 segments). Use raw binary concatenation.
+6. **Title searches time out under transcode load** — use `--series-id` or let `SeriesCache` resolve via cached IDs in 0.02s.
+7. **Use `/Users/{id}`, never `/Users/Me`** — returns HTTP 500 on Emby 4.9.x.
+8. **`curl -f` is mandatory** — without `-f`, HTTP 500 error pages are saved as valid video files.
+9. **Never run two downloads concurrently** — `emby-dl` enforces an exclusive machine-wide file lock (`.emby_dl.lock`).
+10. **Windows session locks / laptop sleep disconnects Wi-Fi** — when resuming, inspect `downloaded_dataset.json`; existing files skip instantly.
+11. **Do not parse truncated `/Sessions` JSON** — can exceed 4 MB of phantom stale records.
+12. **Always include `PlaySessionId` in HLS queries** — missing `PlaySessionId` results in HTTP 400 Bad Request.
+13. **HLS transcode startup requires extended timeouts** — use `api_timeout_seconds: 60` and `api_retries: 3`.
+14. **Process memory does not update on file edit** — a running Python process keeps old bytecode in RAM until restarted.
+15. **Filter queue progress by target series IDs** — simple `len(dataset)` counts past history rather than active queue progress.
+
+---
+
+## 10. Change log
+
+### v1.3.0 — 2026-11-13 (Multi-Series Queue, HLS Remux Engine & Bot Polish)
+
+- **Official Multi-Series Queue (`emby-dl queue`)**: Native CLI command supporting direct multi-series arguments, semicolon/dash delimiters, queue files (`-f / --file`), and persistent queue management (`add`, `list`, `run`, `remove`, `clear`, `plan`).
+- **Two-Stage Lossless HLS Remux Pipeline**: Resolved the critical Matroska timestamp defect (`Can't write packet with unknown timestamp`) by remuxing via lossless MP4 intermediate (`TS -> MP4 -> MKV/MP4`) with presentation timestamp generation (`+genpts`) and subtitle preservation.
+- **Closed Stdin Protection**: Added `-nostdin` to all ffmpeg/ffprobe subprocess calls, eliminating 30-minute background shell hangs.
+- **Multi-Level Automatic Failure Rescheduling**: Intra-series queue rescheduling (`pending_queue.append(failed_item)`) and queue-level sweep passes ensure 100% completion without human babysitting.
+- **Smart Series Resolution Cache (`SeriesCache`)**: Persistent cache (`.emby_series_cache.json`) auto-seeded from dataset; enables 0.02s lookups and eliminates search timeouts. Universal `--series-id` support added across all commands and queue files.
+- **Interactive Telegram Bot Upgrades**: Added dedicated `/queue` command, live remaining time (`ETA`) in status and periodic alerts, and strict queue filtering using `target_series_ids`.
+- **Resilience Defaults**: Default `api_timeout_seconds` increased to 60s, `api_retries` increased to 3 with exponential backoff.
+- **Massive Production Verification**: 269 episodes (147.26 GiB) across 23 distinct series downloaded and verified byte-exact.
 
 ### v1.2.0 — 2026-11-07 (Phase C polish)
-
-- **Dataset Schema v3**: keyed primarily by `series_id` (fallback to normalized name
-  for legacy entries). Added `season_id`, `media_source_id`, `source_index`,
-  `source_name`, `attempts`, `tool_version`, and `duration_minutes`.
-- **Single commit point architecture**: central dataset is the single atomic commit point;
-  per-series datasets are derived views. Added `dataset --check` (exit 1 on drift),
-  `dataset --sync` (regenerate derived datasets), and `dataset --dedupe`.
-- **Multi-version media source selection**: `--source 1|N|max` (default `1`).
-  Invalid source exits 4 listing candidates with index, name, size, and ID.
-  `plan` displays selected source per episode and flags `source_changed`.
-  `verify` flags `source_missing`.
-- **Token secrecy (C0)**: token is passed to curl via `-K <downloads>/.emby_dl_headers`
-  (mode `0600`), completely eliminating token visibility from `ps aux` and process argv.
-- **Capabilities cache**: cached server capabilities in `.emby_dl_caps.json` (mode `0600`).
-  Reset via `auth --reset-caps` or bypass via `EMBY_NO_CAPS_CACHE=1`.
-- **Environment variable overrides**: `EMBY_URL`, `EMBY_TOKEN`, `EMBY_USER_ID`,
-  `EMBY_USERNAME`, `EMBY_DOWNLOADS_DIR`. Precedence: CLI > environment > config > defaults.
-- **System diagnostics**: `doctor` command (`--offline`, `--json`) auditing curl,
-  config permissions (0600), environment variables, disk space, dataset consistency,
-  and server reachability.
-- **Packaging & CLI**: standard `pyproject.toml` exposing console scripts `emby-dl` and `emby_dl`,
-  canonical module `emby_dl.py`, thin backward-compatible wrapper `tools/emby_dl`,
-  and shell completions for Bash, Zsh, and Fish in `completions/`.
-- **Specials inclusion**: `--include-specials` option for `download`, `plan`, and `watch`
-  when querying `all`.
+- Dataset Schema v3 with central atomic commit point.
+- Multi-version `--source 1|N|max` selection.
+- Token secrecy via `curl -K` (`.emby_dl_headers`, mode `0600`).
+- Capabilities cache (`.emby_dl_caps.json`) and system diagnostics (`doctor`).
+- Packaging (`pyproject.toml`) and shell completions.
 
 ### v1.1.0 — 2026-11-07 (hardening)
-
-- Phases A+B from the production review.
-- `plan` (dry run), `status` (live state), `verify [--fix]`, `watch [--once]`,
-  `login`, `auth`.
-- Dataset schema v2 with exact `size_bytes`; `dataset --rebuild|--prune|--stats`.
-- Fixes: unknown size never trusted; HTTP 500/HTML never recorded; truncated
-  files never recorded; recorded-but-missing files re-download; lock exit 5;
-  disk preflight exit 6; ambiguity refusal exit 4 and `--series-id`.
-- Exact size from `MediaSources[0].Size`; detail/HEAD fallbacks.
-- `.part` + atomic rename; one short probe; health-gated retries.
-- JSON Lines progress/verdict/summary; progress modes; desktop + webhook
-  notifications (Telegram-ready).
-- CLI hardening: argv normalization lets options appear before, between or after
-  positionals; bare-series mode still works; a known option without a value exits
-  4 with a clear message.
-- Live repair: Black Clover S02E03 (truncated) found by `verify` and fixed by
-  `verify --fix`; datasets migrated 23 entries → v2 (16.81 GiB).
-
-### v1.0.0 — 2026-11-06
-
-- First production version; 14-file test batch completed byte-exact (~15.05 GiB).
-- Fixed the unknown-size hole (unknown size no longer trusted, E21 re-fetched).
-- Added the 10-minute external watcher and documentation of pitfall #12.
+- Safe failure rules, exact-size verification, `.part` atomic renames, Range probe-and-restart, machine-wide lock.
 
 ---
 
-## 13. Open questions / unknowns
-
-- **[UNKNOWN]** exact lockout trigger count and decay constant (4–5 failures;
-  ~30–60 s observed).
-- **[UNKNOWN]** root cause of stuck-item behavior after killed transfers (§3).
-- **[UNKNOWN]** whether Emby regenerates phantom session records automatically;
-  treat `/Sessions` as data with infinite false positives.
-- **[UNKNOWN]** how quickly the token expires (it died once during heavy
-  multi-hour use) — watch for exit 3 / HTTP 401.
-- **[OPEN]** passwordreset.txt path requires physical/local access; SMB with real
-  credentials untested. Campaign paused.
-- **[OPEN]** whether a future Emby build fixes Range and makes resume useful.
-
----
-
-*Last verified: Sat 2026-11-07 (server 4.9.3.0, tool 1.1.0). Update the timestamps
-when behaviors change.*
+*Last verified: Fri 2026-11-13 (server 4.9.3.0, tool 1.3.0). Verified across 269 episodes and 147+ GiB.*

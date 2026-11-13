@@ -13,6 +13,10 @@ Human usage:
     emby_dl <series> S2 E1-4            # Season 2, episodes 1-4
     emby_dl <series> S2 E3-last         # Season 2, episode 3 to the end
     emby_dl <series> S2E3-7             # one-token form
+    emby_dl queue <series...>           # Download multiple series in one command
+    emby_dl queue -f queue.txt          # Download batch from a queue file
+    emby_dl queue add <series> [spec]   # Add to persistent download queue
+    emby_dl queue list | run | clear    # Manage and execute persistent queue
     emby_dl plan <series> S2 E1-4       # resolve + sizes + skips, download nothing
     emby_dl status                      # live progress of a running download
     emby_dl verify [series] [--fix]     # re-check every recorded file vs server
@@ -21,6 +25,7 @@ Human usage:
     emby_dl search <query> | list <series> | config
     emby_dl login --username me         # store a fresh token (password prompt)
     emby_dl auth                        # check server + token health
+    emby_dl init                        # interactive or scripted initial setup
 
 AI-agent mode:
     Add --json for machine-readable output. Downloads emit JSON Lines events
@@ -41,6 +46,7 @@ from __future__ import annotations
 import argparse
 import collections
 import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 import getpass
 import json
@@ -48,6 +54,8 @@ import os
 import platform
 import re
 import shutil
+import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -70,7 +78,7 @@ try:
 except ImportError:
     msvcrt = None
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 PROG = "emby_dl"
 SCHEMA_VERSION = 3
 
@@ -94,24 +102,33 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "retry_backoff_max_seconds": 600,
         "resume_enabled": True,
         "resume_stall_seconds": 10,
+        "download_mode": "direct",
+        "hls_workers": 4,
+        "hls_segment_retries": 4,
+        "ffmpeg_path": "",
         "disk_reserve_bytes": 2 * 1024 ** 3,
-        "api_timeout_seconds": 20,
-        "api_retries": 1,
+        "api_timeout_seconds": 60,
+        "api_retries": 3,
         "head_timeout_seconds": 6,
+        "completion_grace_seconds": 15,
+        "idle_timeout_seconds": 180,
     },
     "notifications": {
         "desktop": False,
         "webhook_url": "",
         "telegram_chat_id": "",
+        "telegram_bot_token": "",
         "notify_on_start": False,
         "notify_on_complete": True,
         "notify_on_failure": True,
+        "stall_alert_seconds": 300,
     },
 }
 
 LOCAL_STATE_NAME = ".emby_dl_state.json"
 LOCK_NAME = ".emby_dl.lock"
 CAPS_NAME = ".emby_dl_caps.json"
+CURL_PID_NAME = ".emby_dl_curl.json"
 
 
 def get_user_config_path() -> str:
@@ -284,6 +301,10 @@ class AuthError(ConfigError):
     exit_code = 3
 
 
+class HlsExpired(ToolError):
+    """The server dropped the HLS playback session; refresh and retry."""
+
+
 class UsageError(ToolError):
     exit_code = 4
 
@@ -405,27 +426,437 @@ def send_webhook(url: str, title: str, message: str,
         return False
 
 
+# =============================================================================
+# TELEGRAM BOT (notifications + two-way commands)
+# =============================================================================
+
+def telegram_api(token: str, method: str, params: Optional[Dict[str, Any]] = None,
+                 timeout: int = 30) -> Dict[str, Any]:
+    """Call a Telegram Bot API method. Returns parsed JSON or {'ok': False}."""
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = None
+    if params:
+        data = urllib.parse.urlencode(params).encode("utf-8")
+    request = urllib.request.Request(url, data=data,
+                                    method="POST" if data else "GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+        parsed = json.loads(raw.decode("utf-8", "replace"))
+        return parsed if isinstance(parsed, dict) else {"ok": False}
+    except Exception:
+        return {"ok": False}
+
+
+def telegram_send_message(token: str, chat_id: Any, text: str) -> bool:
+    if not token or not chat_id or not text:
+        return False
+    try:
+        result = telegram_api(token, "sendMessage",
+                              {"chat_id": chat_id, "text": text}, timeout=15)
+        return bool(result.get("ok"))
+    except Exception:
+        return False
+
+
+def configure_telegram_bot(token: str) -> None:
+    """Ensure bot commands, descriptions, and polling readiness are configured on Telegram."""
+    try:
+        telegram_api(token, "deleteWebhook", {"drop_pending_updates": "false"})
+    except Exception:
+        pass
+    try:
+        telegram_api(token, "setMyCommands", {
+            "commands": json.dumps([
+                {"command": "start", "description": "Register this chat for notifications"},
+                {"command": "status", "description": "Show current download progress & speed"},
+                {"command": "queue", "description": "Show detailed queue information"},
+                {"command": "help", "description": "List available commands"},
+                {"command": "ping", "description": "Check bot responsiveness"},
+            ]),
+        })
+    except Exception:
+        pass
+    try:
+        telegram_api(token, "setMyDescription", {
+            "description": "بوت إدارة ومتابعة تنزيل المسلسلات عبر أداة emby-dl.\nالأوامر المتاحة: /status, /queue, /help, /ping"
+        })
+        telegram_api(token, "setMyShortDescription", {
+            "short_description": "بوت إشعارات وأوامر تحميل Emby (emby-dl)"
+        })
+    except Exception:
+        pass
+
+
+def run_telegram_bot(config: Dict[str, Any],
+                     progress_state: Dict[str, Any],
+                     stop_event: threading.Event) -> None:
+    """Long-poll Telegram for commands and reply. Runs in a daemon thread."""
+    settings = config.get("notifications", {})
+    if not isinstance(settings, dict):
+        settings = {}
+        config["notifications"] = settings
+    token = settings.get("telegram_bot_token") or ""
+    if not token:
+        return
+    configure_telegram_bot(token)
+    authorized_chat = str(settings.get("telegram_chat_id") or "")
+    offset = 0
+    last_config_check = time.monotonic()
+
+    while not stop_event.is_set():
+        now = time.monotonic()
+        if now - last_config_check >= 30:
+            last_config_check = now
+            try:
+                cfg_path = config.get("_config_path")
+                if cfg_path and os.path.exists(cfg_path):
+                    fresh_cfg = load_config(cfg_path)
+                    new_token = (fresh_cfg.get("notifications") or {}).get("telegram_bot_token") or ""
+                    new_chat = (fresh_cfg.get("notifications") or {}).get("telegram_chat_id") or ""
+                    if new_token and new_token != token:
+                        token = new_token
+                        settings["telegram_bot_token"] = token
+                        configure_telegram_bot(token)
+                        offset = 0
+                    if new_chat:
+                        authorized_chat = str(new_chat)
+                        settings["telegram_chat_id"] = authorized_chat
+            except Exception:
+                pass
+
+        try:
+            upd = telegram_api(token, "getUpdates",
+                               {"offset": offset, "timeout": 20})
+        except Exception:
+            upd = {"ok": False}
+        if not upd.get("ok"):
+            stop_event.wait(5)
+            continue
+        for update in (upd.get("result") or []):
+            try:
+                uid = int(update.get("update_id", 0))
+                offset = uid + 1
+            except (TypeError, ValueError):
+                pass
+            try:
+                msg = update.get("message") or update.get("edited_message") or {}
+                chat = msg.get("chat") or {}
+                chat_id = str(chat.get("id", ""))
+                text = (msg.get("text") or "").strip()
+                if not chat_id or not text:
+                    continue
+                if authorized_chat and chat_id != authorized_chat:
+                    continue
+                if text.startswith("/start"):
+                    if not authorized_chat:
+                        authorized_chat = chat_id
+                        settings["telegram_chat_id"] = authorized_chat
+                        try:
+                            save_config(config)
+                        except Exception:
+                            pass
+                        telegram_send_message(
+                            token, chat_id,
+                            "Registered. You will receive download notifications here.\n"
+                            "Commands: /status, /queue, /help, /ping")
+                    else:
+                        telegram_send_message(
+                            token, chat_id,
+                            "Already registered.\n"
+                            "Commands: /status, /queue, /help, /ping")
+                    continue
+                if not authorized_chat:
+                    telegram_send_message(token, chat_id,
+                                         "Send /start to register this chat.")
+                    continue
+                if text.startswith("/status"):
+                    st = read_state(get_downloads_path(config))
+                    st = st if isinstance(st, dict) else {}
+                    cur_label = st.get("label") or "\u2014"
+                    cur_pct = st.get("percent")
+                    pct_str = (f"{cur_pct:.1f}%" if isinstance(cur_pct, (int, float))
+                               else "\u2014")
+                    running = bool(st.get("running"))
+                    stalled_for = int(progress_state.get("stalled_for") or 0)
+                    if running and stalled_for >= 120:
+                        state_word = "stalled"
+                    else:
+                        state_word = "running" if running else "idle"
+                    completed = int(progress_state.get("completed", 0) or 0)
+                    total = int(progress_state.get("total", 0) or 0)
+                    lines = [
+                        f"Status: {state_word}",
+                        f"Completed: {completed}/{total} "
+                        f"(remaining: {max(0, total - completed)})",
+                        f"Current: {cur_label} ({pct_str})",
+                    ]
+                    qpath = os.path.join(get_downloads_path(config), ".queue_state.json")
+                    if os.path.exists(qpath):
+                        try:
+                            with open(qpath, "r", encoding="utf-8") as qf:
+                                qst = json.load(qf)
+                            if isinstance(qst, dict) and qst.get("running"):
+                                cur_idx = qst.get("current_index", 1)
+                                tot_series = qst.get("total_series", 1)
+                                q_tot = qst.get("total_eps", 0)
+                                target_ids = set(str(x) for x in qst.get("target_series_ids", []))
+                                d_path = os.path.join(get_downloads_path(config), "downloaded_dataset.json")
+                                live_done = 0
+                                if os.path.exists(d_path) and target_ids:
+                                    try:
+                                        with open(d_path, "r", encoding="utf-8") as dh:
+                                            d_data = json.load(dh)
+                                        live_done = sum(1 for e in d_data.get("downloads", []) if str(e.get("series_id")) in target_ids)
+                                    except Exception:
+                                        live_done = 0
+                                if not live_done:
+                                    base_done = qst.get("queue_completed_eps", 0)
+                                    live_done = base_done + completed
+                                pct_q = f" ({round(live_done * 100.0 / q_tot, 1)}%)" if q_tot else ""
+                                lines.insert(1, f"Queue: [{cur_idx}/{tot_series}] {qst.get('current_name', '')}")
+                                if q_tot:
+                                    lines.insert(2, f"Total Queue: {live_done}/{q_tot} episodes{pct_q}")
+                        except Exception:
+                            pass
+                    downloaded = st.get("downloaded")
+                    expected = st.get("total")
+                    if isinstance(downloaded, int) and isinstance(expected, int):
+                        lines.append(
+                            f"Downloaded: {human_bytes(downloaded)} / "
+                            f"{human_bytes(expected)}")
+                    speed = st.get("speed_bps")
+                    if isinstance(speed, (int, float)):
+                        lines.append(f"Speed: {human_bytes(speed)}/s")
+                    eta = st.get("eta_seconds")
+                    if (eta is None or eta == 0) and isinstance(speed, (int, float)) and speed > 0:
+                        if isinstance(downloaded, int) and isinstance(expected, int) and expected > downloaded:
+                            eta = int((expected - downloaded) / speed)
+                    if eta is not None and running:
+                        lines.append(f"ETA: {human_duration(eta)}")
+                    if running and stalled_for >= 120:
+                        lines.append(f"No progress for {stalled_for // 60} min")
+                    telegram_send_message(token, chat_id, "\n".join(lines))
+                elif text.startswith("/queue") or text.startswith("/q"):
+                    qpath = os.path.join(get_downloads_path(config), ".queue_state.json")
+                    d_path = os.path.join(get_downloads_path(config), "downloaded_dataset.json")
+                    d_data = {}
+                    if os.path.exists(d_path):
+                        try:
+                            with open(d_path, "r", encoding="utf-8") as dh:
+                                d_data = json.load(dh)
+                        except Exception:
+                            d_data = {}
+                    all_downloads = d_data.get("downloads", [])
+
+                    qst = None
+                    if os.path.exists(qpath):
+                        try:
+                            with open(qpath, "r", encoding="utf-8") as qf:
+                                qst = json.load(qf)
+                        except Exception:
+                            qst = None
+
+                    q_lines = []
+                    if qst and isinstance(qst, dict) and qst.get("running"):
+                        cur_idx = qst.get("current_index", 1)
+                        tot_series = qst.get("total_series", 1)
+                        cur_name = qst.get("current_name", "—")
+                        q_tot = qst.get("total_eps", 0)
+                        target_ids = set(str(x) for x in qst.get("target_series_ids", []))
+
+                        live_done = sum(1 for e in all_downloads if str(e.get("series_id")) in target_ids)
+                        if not live_done:
+                            base_done = qst.get("queue_completed_eps", 0)
+                            live_done = base_done + int(progress_state.get("completed", 0) or 0)
+
+                        pct_q = round(live_done * 100.0 / q_tot, 1) if q_tot else 0
+
+                        q_lines.append("📋 تفاصيل طابور التحميل (Queue Details)")
+                        q_lines.append("الحالة: قيد التشغيل 🟢")
+                        q_lines.append(f"المسلسل الحالي: [{cur_idx}/{tot_series}] {cur_name}")
+                        q_lines.append(f"إجمالي تقدم الطابور: {live_done}/{q_tot} حلقة ({pct_q}%)")
+                        q_lines.append("")
+
+                        series_list = qst.get("series_list", [])
+                        if series_list:
+                            q_lines.append("قائمة المسلسلات في الطابور:")
+                            for idx, s_item in enumerate(series_list, start=1):
+                                s_id = str(s_item.get("id") or "")
+                                s_name = s_item.get("name") or "—"
+                                s_spec = s_item.get("spec") or "all"
+                                s_total = s_item.get("total", 0)
+                                s_size = s_item.get("size_bytes")
+                                size_str = f" (~{human_bytes(s_size)})" if s_size else ""
+
+                                s_done = sum(1 for e in all_downloads if str(e.get("series_id")) == s_id)
+                                if s_total and s_done >= s_total:
+                                    icon = "✅"
+                                elif idx == cur_idx:
+                                    icon = "⏳"
+                                elif s_done > 0:
+                                    icon = "🔄"
+                                else:
+                                    icon = "🕒"
+
+                                q_lines.append(f"{idx}. {icon} {s_name} [{s_spec}] — ({s_done}/{s_total} حلقات){size_str}")
+
+                            remaining_eps = max(0, q_tot - live_done)
+                            q_lines.append("")
+                            q_lines.append(f"المتبقي في الطابور: {remaining_eps} حلقة")
+                        else:
+                            q_lines.append(f"• المسلسل الحالي: {cur_name}")
+                            q_lines.append(f"• المتبقي في الطابور: {max(0, q_tot - live_done)} حلقة")
+                    else:
+                        p_items = load_persistent_queue(get_downloads_path(config))
+                        if p_items:
+                            q_lines.append("📋 الطابور الدائم (في الانتظار):")
+                            for idx, it in enumerate(p_items, start=1):
+                                q_lines.append(f"{idx}. 🕒 {it.series} [{' '.join(it.spec)}]")
+                            q_lines.append("")
+                            q_lines.append(f"إجمالي المسلسلات المنتظرة: {len(p_items)}")
+                            q_lines.append("لتشغيل الطابور: emby-dl queue run")
+                        elif qst and isinstance(qst, dict) and qst.get("status") == "completed":
+                            tot = qst.get("total_eps", 0)
+                            done = qst.get("queue_completed_eps", 0)
+                            ended = qst.get("ended_at", "—")
+                            q_lines.append("🎉 اكتمل تنفيذ آخر طابور بنجاح!")
+                            q_lines.append(f"• الحلقات المكتملة: {done}/{tot} حلقة (100%)")
+                            q_lines.append(f"• انتهى في: {ended}")
+                        else:
+                            q_lines.append("لا يوجد طابور تحميل نشط حالياً.")
+                            q_lines.append("لإضافة مسلسلات للطابور: emby-dl queue add <series> [spec...]")
+
+                    telegram_send_message(token, chat_id, "\n".join(q_lines))
+                elif text.startswith("/help"):
+                    telegram_send_message(
+                        token, chat_id,
+                        "Commands:\n"
+                        "/status - Current download progress, speed & ETA\n"
+                        "/queue - Detailed queue breakdown & series list\n"
+                        "/ping - Pong (bot responsiveness)\n"
+                        "/help - This message"
+                    )
+                elif text.startswith("/ping"):
+                    telegram_send_message(token, chat_id, "pong")
+                else:
+                    telegram_send_message(token, chat_id, "Unknown command. /help")
+            except Exception:
+                continue
+
+
+
 def notify(config: Dict[str, Any], title: str, message: str,
            urgency: str = "normal", force: bool = False) -> None:
     settings = config.get("notifications", {})
-    if not force and not settings.get("desktop") and not settings.get("webhook_url"):
+    if not force and not settings.get("desktop") and not settings.get("webhook_url") and not settings.get("telegram_bot_token"):
         return
     if settings.get("desktop"):
-        sender = shutil.which("notify-send")
-        if sender:
-            env = dict(os.environ)
-            env.setdefault("DISPLAY", ":0")
-            try:
-                subprocess.run(
-                    [sender, "-a", PROG, "-u", urgency, title, message],
-                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=10, check=False,
+        if os.name == "nt" or sys.platform == "win32":
+            sender = shutil.which("powershell") or shutil.which("powershell.exe")
+            if sender:
+                def _ps_escape(value: str) -> str:
+                    return str(value).replace("'", "''")
+                ps_script = (
+                    "Add-Type -AssemblyName System.Windows.Forms; "
+                    "$n = New-Object System.Windows.Forms.NotifyIcon; "
+                    "$n.Icon = [System.Drawing.SystemIcons]::Information; "
+                    "$n.BalloonTipIcon = 'Info'; "
+                    "$n.BalloonTipTitle = '%s'; " % _ps_escape(title)
+                    + "$n.BalloonTipText = '%s'; " % _ps_escape(message)
+                    + "$n.Visible = $true; "
+                    "$n.ShowBalloonTip(5000); "
+                    "Start-Sleep -Seconds 6; "
+                    "$n.Dispose()"
                 )
-            except Exception:
-                pass
+                try:
+                    subprocess.Popen(
+                        [sender, "-WindowStyle", "Hidden", "-Command", ps_script],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
+        else:
+            sender = shutil.which("notify-send")
+            if sender:
+                env = dict(os.environ)
+                env.setdefault("DISPLAY", ":0")
+                try:
+                    subprocess.run(
+                        [sender, "-a", PROG, "-u", urgency, title, message],
+                        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=10, check=False,
+                    )
+                except Exception:
+                    pass
+    bot_token = settings.get("telegram_bot_token") or ""
+    chat_id = settings.get("telegram_chat_id") or ""
+    if bot_token and chat_id:
+        telegram_send_message(bot_token, chat_id, f"{title}\n{message}")
     url = settings.get("webhook_url") or ""
     if url:
         send_webhook(url, title, message, settings.get("telegram_chat_id", ""))
+
+
+# =============================================================================
+# SERIES RESOLUTION CACHE
+# =============================================================================
+
+SERIES_CACHE_NAME = ".emby_series_cache.json"
+
+
+class SeriesCache:
+    """Persistent mapping of normalized series names to Emby series IDs.
+
+    Prevents expensive full-library text searches and timeouts by caching
+    known series IDs locally. Automatically seeds from downloaded_dataset.json.
+    """
+
+    def __init__(self, downloads_path: str):
+        self.downloads_path = downloads_path
+        self.path = os.path.join(downloads_path, SERIES_CACHE_NAME)
+        self._cache: Optional[Dict[str, str]] = None
+
+    def _load(self) -> Dict[str, str]:
+        if self._cache is not None:
+            return self._cache
+        cache: Dict[str, str] = {}
+        d_path = os.path.join(self.downloads_path, "downloaded_dataset.json")
+        if os.path.exists(d_path):
+            try:
+                with open(d_path, "r", encoding="utf-8") as dh:
+                    d_data = json.load(dh)
+                for entry in d_data.get("downloads", []):
+                    s_name = entry.get("series_name")
+                    s_id = entry.get("series_id")
+                    if s_name and s_id:
+                        cache[normalize_name(s_name)] = str(s_id)
+            except Exception:
+                pass
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        cache[normalize_name(k)] = str(v)
+            except Exception:
+                pass
+        self._cache = cache
+        return self._cache
+
+    def get(self, query: str) -> Optional[str]:
+        cache = self._load()
+        return cache.get(normalize_name(query))
+
+    def set(self, query: str, series_id: str) -> None:
+        cache = self._load()
+        norm = normalize_name(query)
+        cache[norm] = str(series_id)
+        try:
+            atomic_write_json(self.path, cache, mode=0o600)
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -441,8 +872,13 @@ class EmbyAPI:
         self.token = config.get("access_token") or ""
         self.user_id = config.get("user_id") or ""
         self.settings = config.get("download_settings", DEFAULT_CONFIG["download_settings"])
-        self.timeout = int(self.settings.get("api_timeout_seconds", 20))
-        self.api_retries = int(self.settings.get("api_retries", 1))
+        self.timeout = int(self.settings.get("api_timeout_seconds", 60))
+        self.api_retries = int(self.settings.get("api_retries", 3))
+        try:
+            dl_path = get_downloads_path(config)
+            self._series_cache = SeriesCache(dl_path)
+        except Exception:
+            self._series_cache = None
         if not self.server_url:
             raise ConfigError("Missing server_url in configuration")
         if not self.token and self.server_url and self.config.get("username"):
@@ -509,8 +945,9 @@ class EmbyAPI:
                         continue
                     raise last_error
                 raise ServerError(f"Server returned HTTP {exc.code} for {path}")
-            except urllib.error.URLError as exc:
-                last_error = ServerError(f"Cannot connect to server: {exc.reason}")
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                reason = getattr(exc, "reason", str(exc))
+                last_error = ServerError(f"Cannot connect to server: {reason}")
                 if attempt < attempts:
                     self._backoff(attempt)
                     continue
@@ -538,7 +975,6 @@ class EmbyAPI:
         data = self._request_json(
             f"/Items?SearchTerm={quoted}&Recursive=true&IncludeItemTypes=Series&Limit={limit}"
             "&Fields=ProductionYear,ChildCount",
-            retries=1,
         )
         return data.get("Items", []) if isinstance(data, dict) else []
 
@@ -669,29 +1105,56 @@ class EmbyAPI:
         return None
 
     def resolve_series(self, query: str, series_id: Optional[str] = None) -> Dict[str, Any]:
-        """Resolve a series name, refusing ambiguous matches (exit 4)."""
+        """Resolve a series name, refusing ambiguous matches (exit 4).
+
+        Checks local series cache first to bypass expensive server-side searches.
+        """
+        # 1. Explicit series_id provided by user
         if series_id:
             item = self.get_item(series_id)
             if not item:
                 raise NotFoundError(f"Series id not found: {series_id}")
             if item.get("Type") and item.get("Type") != "Series":
                 raise UsageError(f"Item {series_id} is not a Series (type={item.get('Type')})")
+            if self._series_cache and item.get("Name"):
+                self._series_cache.set(item["Name"], str(series_id))
+                self._series_cache.set(query, str(series_id))
             return item
 
+        # 2. Check local series cache & dataset (instant 0.02s lookup)
+        if self._series_cache:
+            cached_id = self._series_cache.get(query)
+            if cached_id:
+                try:
+                    item = self.get_item(cached_id)
+                    if item and item.get("Type") == "Series" and normalize_name(item.get("Name", "")) == normalize_name(query):
+                        return item
+                except Exception:
+                    pass
+
+        # 3. Fall back to search
         results = self.search_series(query)
         if not results:
             raise NotFoundError(f"Series not found: {query}")
         wanted = normalize_name(query)
         exact = [r for r in results if normalize_name(r.get("Name", "")) == wanted]
 
+        resolved_item = None
         if len(exact) == 1:
-            return exact[0]
-        if len(exact) > 1:
+            resolved_item = exact[0]
+        elif len(exact) > 1:
             candidates = exact
         elif len(results) == 1:
-            return results[0]
+            resolved_item = results[0]
         else:
             candidates = results
+
+        if resolved_item:
+            if self._series_cache and resolved_item.get("Id"):
+                self._series_cache.set(query, str(resolved_item["Id"]))
+                if resolved_item.get("Name"):
+                    self._series_cache.set(resolved_item["Name"], str(resolved_item["Id"]))
+            return resolved_item
 
         lines = []
         for item in candidates[:15]:
@@ -1330,6 +1793,130 @@ def _unlock_handle(handle) -> None:
             pass
 
 
+def _pid_is_alive(pid: int) -> bool:
+    """Best-effort liveness check that never signals the target process."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return False
+                return code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _pid_name(pid: int) -> str:
+    """Return the executable name for a PID, or an empty string if unknown."""
+    if pid <= 0:
+        return ""
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))
+            if not handle:
+                return ""
+            try:
+                size = wintypes.DWORD(32768)
+                buffer = ctypes.create_unicode_buffer(size.value)
+                if not kernel32.QueryFullProcessImageNameW(
+                        handle, 0, buffer, ctypes.byref(size)):
+                    return ""
+                return os.path.basename(buffer.value).lower()
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return ""
+    try:
+        with open(f"/proc/{int(pid)}/comm", "r", encoding="utf-8") as handle:
+            return handle.read().strip().lower()
+    except OSError:
+        return ""
+
+
+def _terminate_pid(pid: int) -> None:
+    """Terminate a process by PID, ignoring already-dead targets."""
+    if pid <= 0 or pid == os.getpid():
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=15, check=False,
+            )
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _write_curl_pid(downloads_path: str, pid: int, part_path: str) -> None:
+    """Remember the active curl child so a later run can clean it up."""
+    payload = {
+        "pid": int(pid),
+        "python_pid": os.getpid(),
+        "part": os.path.basename(part_path),
+        "started_at": now_iso(),
+    }
+    try:
+        atomic_write_json(os.path.join(downloads_path, CURL_PID_NAME), payload)
+    except OSError:
+        pass
+
+
+def _clear_curl_pid(downloads_path: str, pid: int) -> None:
+    path = os.path.join(downloads_path, CURL_PID_NAME)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            tracked = json.load(handle)
+        if int(tracked.get("pid") or 0) != int(pid):
+            return
+        os.unlink(path)
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        pass
+
+
+def _kill_stale_curl(downloads_path: str) -> None:
+    """Kill a curl left behind by a previous run that no longer holds the lock."""
+    path = os.path.join(downloads_path, CURL_PID_NAME)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            tracked = json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        return
+    pid = parse_int(tracked.get("pid"))
+    owner = parse_int(tracked.get("python_pid"))
+    if pid:
+        name = _pid_name(pid)
+        if name and "curl" not in name:
+            pid = None  # PID was reused by an unrelated process.
+    if pid and _pid_is_alive(pid) and not (owner and _pid_is_alive(owner)):
+        _terminate_pid(pid)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 class DownloadLock:
     """Exclusive machine-wide lock for actual downloads (not for planning)."""
 
@@ -1352,6 +1939,8 @@ class DownloadLock:
                 + (f" (pid {holder})" if holder else "")
                 + f"; lock: {self.path}"
             )
+        # A previous process may have been killed while curl kept writing.
+        _kill_stale_curl(os.path.dirname(self.path))
         try:
             handle.seek(0)
             handle.truncate()
@@ -1683,15 +2272,20 @@ def _episode_status(dataset: DatasetManager, downloads_path: str, series_name: s
     recorded = dataset.get_entry(series_name, season, number, series_id)
     on_disk = os.path.exists(dest)
     disk_size = os.path.getsize(dest) if on_disk else None
+    recorded_size = parse_int((recorded or {}).get("size_bytes"))
     recorded_source = str((recorded or {}).get("media_source_id") or "")
     source_changed = bool(recorded and source_id and recorded_source
                           and recorded_source != source_id)
+
+    # A remuxed file (e.g. HLS -> MKV) legitimately differs in size from the
+    # server's source. Trust the dataset when it recorded that exact size.
+    matches_recorded = bool(recorded_size and disk_size == recorded_size)
 
     reason = "not_recorded"
     status = "todo"
     if expected is None:
         reason = "size_unknown"
-    elif on_disk and disk_size == expected:
+    elif on_disk and not source_changed and (disk_size == expected or matches_recorded):
         status = "skip"
         reason = "ok" if recorded else "self_heal"
     elif on_disk:
@@ -1936,10 +2530,37 @@ class DownloadEngine:
         except OSError as exc:
             raise ConfigError(f"Could not start curl: {exc}")
 
+        _write_curl_pid(self.downloads_path, process.pid, part_path)
+
+        completion_grace = max(1, int(self.settings.get(
+            "completion_grace_seconds", 15)))
+        # This Emby server cannot serve HTTP Range requests, so an aborted
+        # stream cannot be resumed. Prefer waiting out a long stall over
+        # throwing away a nearly complete transfer.
+        idle_timeout = max(600, int(self.settings.get(
+            "idle_timeout_seconds", max(3600, int(stall_seconds) * 2))))
+        forced_complete = False
+        last_size = -1
+        last_change = time.monotonic()
         try:
             while process.poll() is None:
                 size = os.path.getsize(part_path) if os.path.exists(part_path) else 0
                 reporter.update(size)
+                now = time.monotonic()
+                if size != last_size:
+                    last_size = size
+                    last_change = now
+                if (reporter.total and size >= reporter.total
+                        and now - last_change >= completion_grace):
+                    # The server can keep the connection open after the final
+                    # byte; once the expected size is stable, stop waiting.
+                    forced_complete = True
+                    process.terminate()
+                    break
+                if now - last_change >= idle_timeout:
+                    # curl's own --speed-* watchdog can miss half-open sockets.
+                    process.terminate()
+                    break
                 time.sleep(0.25)
             try:
                 stdout, stderr = process.communicate(timeout=30)
@@ -1954,9 +2575,23 @@ class DownloadEngine:
                 process.kill()
             reporter.finish("interrupted")
             raise
+        finally:
+            if process.poll() is None:
+                process.kill()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+            _clear_curl_pid(self.downloads_path, process.pid)
 
         size = os.path.getsize(part_path) if os.path.exists(part_path) else 0
         reporter.update(size)
+        if forced_complete and size == reporter.total:
+            reporter.event(
+                "warning",
+                message=(f"{reporter.label}: connection stayed open at 100%; "
+                         f"stopped curl after {completion_grace}s"),
+            )
         http_code = 0
         content_type = ""
         for line in reversed((stdout or "").strip().splitlines()):
@@ -1971,7 +2606,484 @@ class DownloadEngine:
             "size": size,
             "content_type": content_type,
             "stderr": (stderr or "").strip(),
+            "forced_complete": forced_complete and size == reporter.total,
         }
+
+    # -- HLS fallback ------------------------------------------------------
+    #
+    # Some Emby servers reset long HTTP transfers and do not honour Range
+    # requests, so a partial direct download can never be resumed. HLS splits
+    # the same stream into short, independently fetchable segments; existing
+    # segments are kept between runs, which makes the download resumable.
+
+    @staticmethod
+    def _device_id() -> str:
+        return "emby_dl_hls"
+
+    def _ffmpeg_tools(self) -> Tuple[str, str]:
+        configured = str(self.settings.get("ffmpeg_path") or "").strip()
+        candidates: List[str] = []
+        if configured:
+            candidates.append(configured)
+        found = shutil.which("ffmpeg")
+        if found:
+            candidates.append(found)
+        if os.name == "nt":
+            candidates.append(r"C:\Program Files\DownloadHelper CoApp\ffmpeg.exe")
+        ffmpeg = next((path for path in candidates if path and os.path.exists(path)), "")
+        if not ffmpeg:
+            raise ConfigError(
+                "HLS mode needs ffmpeg. Install it (winget install Gyan.FFmpeg) "
+                "or set download_settings.ffmpeg_path."
+            )
+        probe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+        ffprobe = os.path.join(os.path.dirname(ffmpeg), probe_name)
+        if not os.path.exists(ffprobe):
+            ffprobe = shutil.which("ffprobe") or ""
+        return ffmpeg, ffprobe
+
+    def _fetch_text(self, url: str, timeout: Optional[int] = None, retries: int = 3) -> str:
+        req_timeout = timeout if timeout is not None else max(60, self.api.timeout)
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, retries + 1):
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "X-Emby-Token": self.api.token,
+                    "Accept": "*/*",
+                    "User-Agent": f"{PROG}/{VERSION}",
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=req_timeout) as response:
+                    return response.read().decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as exc:
+                if exc.code in (404, 410):
+                    raise HlsExpired(f"HLS playlist expired (HTTP {exc.code})")
+                raise ServerError(f"HLS request failed (HTTP {exc.code})")
+            except (TimeoutError, OSError, urllib.error.URLError) as exc:
+                last_exc = exc
+                if attempt < retries:
+                    time.sleep(2 * attempt)
+                    continue
+        reason = getattr(last_exc, "reason", str(last_exc))
+        raise ServerError(f"HLS request failed: {reason}")
+
+    def _hls_session(self, item_id: str, media_source_id: str,
+                     play_session_id: str = "") -> Dict[str, Any]:
+        session_id = play_session_id
+        if not session_id:
+            body = json.dumps({
+                "UserId": self.api.user_id,
+                "StartTimeTicks": 0,
+                "IsPlayback": True,
+                "AutoOpenLiveStream": False,
+            }).encode("utf-8")
+            request = urllib.request.Request(
+                self.api._url(f"/Items/{item_id}/PlaybackInfo"),
+                data=body,
+                headers={
+                    "X-Emby-Token": self.api.token,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": f"{PROG}/{VERSION}",
+                },
+                method="POST",
+            )
+            info = None
+            last_err: Optional[Exception] = None
+            pb_timeout = max(60, self.api.timeout)
+            for attempt in range(1, 4):
+                try:
+                    with urllib.request.urlopen(request, timeout=pb_timeout) as response:
+                        info = json.loads(response.read().decode("utf-8"))
+                        break
+                except urllib.error.HTTPError as exc:
+                    if exc.code in (401, 403):
+                        raise AuthError(f"PlaybackInfo authentication failed (HTTP {exc.code})")
+                    last_err = exc
+                    if attempt < 3:
+                        time.sleep(2 * attempt)
+                except (TimeoutError, OSError, urllib.error.URLError) as exc:
+                    last_err = exc
+                    if attempt < 3:
+                        time.sleep(2 * attempt)
+            if not info:
+                reason = getattr(last_err, "reason", str(last_err))
+                raise ServerError(f"Cannot reach server for PlaybackInfo: {reason}")
+            session_id = str(info.get("PlaySessionId") or "")
+            if not session_id:
+                raise ServerError(f"Server returned no PlaySessionId for item {item_id}")
+
+        query = urllib.parse.urlencode({
+            "MediaSourceId": media_source_id,
+            "PlaySessionId": session_id,
+            "DeviceId": self._device_id(),
+            "api_key": self.api.token,
+            "VideoCodec": "h264",
+            "AudioCodec": "aac",
+            "TranscodingContainer": "ts",
+            "TranscodingProtocol": "hls",
+            "SegmentContainer": "ts",
+            "MinSegments": "1",
+            "BreakOnNonKeyFrames": "True",
+        })
+        master_url = self.api._url(f"/Videos/{item_id}/master.m3u8?{query}")
+        master = self._fetch_text(master_url)
+        variant = ""
+        lines = master.splitlines()
+        for index, line in enumerate(lines):
+            if line.startswith("#EXT-X-STREAM-INF"):
+                for follow in lines[index + 1:]:
+                    if follow and not follow.startswith("#"):
+                        variant = follow.strip()
+                        break
+                break
+        if not variant:
+            raise ServerError(f"HLS master playlist has no variant for item {item_id}")
+
+        variant_url = urllib.parse.urljoin(master_url, variant)
+        playlist = self._fetch_text(variant_url)
+        segments: List[Tuple[float, str]] = []
+        pending = 0.0
+        for line in playlist.splitlines():
+            if line.startswith("#EXTINF:"):
+                try:
+                    pending = float(line.split(":", 1)[1].split(",", 1)[0])
+                except ValueError:
+                    pending = 0.0
+            elif line and not line.startswith("#"):
+                segments.append((pending, urllib.parse.urljoin(variant_url, line.strip())))
+                pending = 0.0
+        if not segments:
+            raise ServerError(f"HLS playlist has no segments for item {item_id}")
+        return {
+            "play_session_id": session_id,
+            "segments": segments,
+            "duration": sum(duration for duration, _ in segments),
+        }
+
+    def _download_segment(self, curl: str, header_file: str, url: str,
+                          path: str, retries: int) -> None:
+        tmp = path + ".tmp"
+        last_error = ""
+        for attempt in range(1, retries + 1):
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
+            try:
+                result = subprocess.run(
+                    [curl, "-f", "-L", "-sS",
+                     "--max-time", "120",
+                     "--speed-limit", "500", "--speed-time", "60",
+                     "-K", header_file, "-o", tmp,
+                     "-w", "%{http_code}", url],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=180,
+                )
+            except subprocess.TimeoutExpired:
+                result = None
+
+            http_code = ""
+            if result is not None and result.stdout:
+                stripped = result.stdout.strip()
+                if stripped[-3:].isdigit():
+                    http_code = stripped[-3:]
+
+            # The server dropped the playback session: refresh it upstream
+            # instead of retrying the same dead segment URL.
+            if http_code in ("404", "410"):
+                try:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                except OSError:
+                    pass
+                raise HlsExpired(
+                    f"segment {os.path.basename(path)} expired (HTTP {http_code})"
+                )
+            if http_code in ("401", "403"):
+                try:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                except OSError:
+                    pass
+                raise AuthError(
+                    f"segment {os.path.basename(path)} rejected (HTTP {http_code})"
+                )
+
+            ok = bool(result is not None and result.returncode == 0
+                      and os.path.exists(tmp) and os.path.getsize(tmp) > 0)
+            if ok:
+                with open(tmp, "rb") as handle:
+                    first = handle.read(1)
+                if first == b"\x47":  # MPEG-TS sync byte
+                    os.replace(tmp, path)
+                    return
+                last_error = "response is not an MPEG-TS segment"
+            elif result is not None:
+                last_error = (result.stderr or f"curl rc={result.returncode}").strip()
+            else:
+                last_error = "segment timed out"
+            if attempt < retries:
+                time.sleep(min(30, 2 ** attempt))
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+        raise ServerError(f"segment {os.path.basename(path)} failed: {last_error}")
+
+    def _subtitle_text(self, item_id: str, media_source_id: str,
+                       source: Optional[Dict[str, Any]]) -> Tuple[str, str]:
+        """Return (subtitle text, language) for the first text subtitle track."""
+        for stream in (source or {}).get("MediaStreams") or []:
+            if stream.get("Type") != "Subtitle":
+                continue
+            index = stream.get("Index")
+            if index is None:
+                continue
+            url = self.api._url(
+                f"/Videos/{item_id}/{media_source_id}/Subtitles/{index}/Stream.srt"
+                f"?api_key={urllib.parse.quote(self.api.token)}"
+            )
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "X-Emby-Token": self.api.token,
+                    "Accept": "*/*",
+                    "User-Agent": f"{PROG}/{VERSION}",
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    raw = response.read()
+                text = raw.decode("utf-8", errors="replace")
+                if text.strip() and "-->" in text:
+                    return text, str(stream.get("Language") or "ara")
+            except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+                continue
+        return "", ""
+
+    def _hls_download(self, item_id: str, media_source_id: str, dest: str,
+                      expected: int, reporter: ProgressReporter, label: str,
+                      source: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        ffmpeg, ffprobe = self._ffmpeg_tools()
+        curl = shutil.which("curl")
+        if not curl:
+            raise ConfigError("curl is required but was not found in PATH")
+        header_file = self._header_file()
+        segment_retries = max(1, int(self.settings.get("hls_segment_retries", 4)))
+        workers = max(1, min(8, int(self.settings.get("hls_workers", 4))))
+        seg_dir = dest + ".hls"
+        os.makedirs(seg_dir, exist_ok=True)
+
+        session = self._hls_session(item_id, media_source_id)
+        segments = session["segments"]
+        total = len(segments)
+        reporter.event("hls", message=f"{label}: HLS playlist with {total} segments")
+
+        def seg_path(index: int) -> str:
+            return os.path.join(seg_dir, f"{index:05d}.ts")
+
+        def segment_ready(index: int) -> bool:
+            path = seg_path(index)
+            return os.path.exists(path) and os.path.getsize(path) > 0
+
+        completed = sum(1 for i in range(total) if segment_ready(i))
+
+        def report() -> None:
+            synthetic = int(expected * completed / total) if total else 0
+            reporter.update(min(synthetic, max(0, expected - 1)), expected)
+
+        report()
+
+        def worker(index: int) -> None:
+            self._download_segment(
+                curl, header_file, segments[index][1], seg_path(index),
+                segment_retries,
+            )
+
+        # Emby expires the playback session after roughly a minute, so keep
+        # refreshing it and resume only the segments that are still missing.
+        stalled_rounds = 0
+        while True:
+            missing = [index for index in range(total) if not segment_ready(index)]
+            if not missing:
+                break
+            before = completed
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(worker, index): index for index in missing}
+                try:
+                    for future in as_completed(futures):
+                        index = futures[future]
+                        try:
+                            future.result()
+                            completed += 1
+                            if completed % 10 == 0 or completed == total:
+                                report()
+                        except HlsExpired as exc:
+                            reporter.event(
+                                "warning", message=f"{label}: {exc}"
+                            )
+                        except AuthError:
+                            for pending in futures:
+                                pending.cancel()
+                            raise
+                        except Exception as exc:  # noqa: BLE001 - per-segment isolation
+                            reporter.event(
+                                "warning",
+                                message=f"{label}: segment {index} failed ({exc})",
+                            )
+                finally:
+                    for pending in futures:
+                        pending.cancel()
+
+            if completed > before:
+                stalled_rounds = 0
+            else:
+                stalled_rounds += 1
+                if stalled_rounds >= 3:
+                    remaining = sum(
+                        1 for index in range(total) if not segment_ready(index)
+                    )
+                    raise ServerError(
+                        f"{label}: {remaining} HLS segments failed"
+                    )
+
+            if all(segment_ready(index) for index in range(total)):
+                break
+
+            reporter.event(
+                "retry",
+                message=(f"{label}: refreshing HLS session "
+                         f"({completed}/{total} segments)"),
+            )
+            try:
+                refreshed = self._hls_session(item_id, media_source_id)
+                if len(refreshed["segments"]) == total:
+                    segments = refreshed["segments"]
+            except ToolError:
+                pass
+            report()
+
+        ts_path = dest + ".ts"
+        mp4_path = dest + ".remux.mp4"
+        remux_path = dest + ".remux.final"
+        srt_path = dest + ".srt.tmp"
+        matroska = not dest.lower().endswith(".mp4")
+        container_name = "MKV" if matroska else "MP4"
+        success = False
+
+        def run_ffmpeg(args: List[str]) -> "subprocess.CompletedProcess[str]":
+            # -nostdin prevents ffmpeg from blocking on a closed terminal, which
+            # previously surfaced as a 30 minute "timed out" remux.
+            return subprocess.run(
+                [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+                 "-y"] + args,
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=1800,
+            )
+
+        def finalize(input_path: str,
+                     include_subtitle: bool) -> "subprocess.CompletedProcess[str]":
+            args = ["-i", input_path]
+            mapping = ["-map", "0:v:0"]
+            if include_subtitle:
+                args += ["-i", srt_path]
+                mapping += ["-map", "1:0"]
+            mapping += ["-map", "0:a:0?", "-c", "copy"]
+            if include_subtitle:
+                mapping += ["-c:s", "srt",
+                            "-metadata:s:s:0", f"language={language}"]
+            if matroska:
+                mapping += ["-f", "matroska"]
+            else:
+                mapping += ["-movflags", "+faststart", "-f", "mp4"]
+            return run_ffmpeg(args + mapping + [remux_path])
+
+        try:
+            with open(ts_path, "wb") as output:
+                for index in range(total):
+                    with open(seg_path(index), "rb") as chunk:
+                        shutil.copyfileobj(chunk, output, 1024 * 1024)
+            reporter.event(
+                "hls", message=f"{label}: remuxing to {container_name}"
+            )
+
+            subtitle, language = self._subtitle_text(item_id, media_source_id, source)
+            if subtitle and matroska:
+                with open(srt_path, "w", encoding="utf-8") as handle:
+                    handle.write(subtitle)
+            else:
+                subtitle = ""
+
+            # Emby HLS video packets often carry no timestamp. Matroska refuses
+            # them ("Can't write packet with unknown timestamp") while MP4
+            # accepts and repairs them, so always go through an MP4
+            # intermediate before writing the final container.
+            result = run_ffmpeg(
+                ["-fflags", "+genpts", "-i", ts_path,
+                 "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+                 "-f", "mp4", mp4_path]
+            )
+            mp4_ready = result.returncode == 0 and os.path.exists(mp4_path)
+            if mp4_ready:
+                result = finalize(mp4_path, bool(subtitle))
+            else:
+                # Fall back to a direct remux for sources that already carry
+                # valid timestamps.
+                result = finalize(ts_path, bool(subtitle))
+            if result.returncode != 0 and subtitle:
+                # Never lose the episode over a subtitle muxing problem.
+                reporter.event(
+                    "warning",
+                    message=(f"{label}: subtitle mux failed, remuxing without it"),
+                )
+                result = finalize(mp4_path if mp4_ready else ts_path, False)
+            if result.returncode != 0 or not os.path.exists(remux_path):
+                raise ConfigError(
+                    f"ffmpeg remux failed: {(result.stderr or '').strip()}"
+                )
+
+            actual_duration = 0.0
+            if ffprobe:
+                probe = subprocess.run(
+                    [ffprobe, "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", remux_path],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=180,
+                )
+                try:
+                    actual_duration = float((probe.stdout or "").strip())
+                except ValueError:
+                    actual_duration = 0.0
+            expected_duration = float(session.get("duration") or 0)
+            if actual_duration and expected_duration:
+                tolerance = max(90.0, expected_duration * 0.03)
+                if abs(actual_duration - expected_duration) > tolerance:
+                    raise ConfigError(
+                        f"duration mismatch: {actual_duration:.1f}s vs "
+                        f"{expected_duration:.1f}s"
+                    )
+
+            os.replace(remux_path, dest)
+            success = True
+            return {
+                "size": os.path.getsize(dest),
+                "duration": actual_duration,
+                "segments": total,
+            }
+        finally:
+            for path in (ts_path, mp4_path, remux_path, srt_path):
+                try:
+                    if os.path.exists(path):
+                        os.unlink(path)
+                except OSError:
+                    pass
+            if success:
+                shutil.rmtree(seg_dir, ignore_errors=True)
 
     def _entry(self, series_name: str, series_id: str, season: int,
                episode: int, episode_id: str, original_name: str,
@@ -2084,11 +3196,13 @@ class DownloadEngine:
             return outcome("failed", None, "size_unknown")
 
         recorded = self.dataset.get_entry(series_name, season, episode_number, series_id)
+        recorded_size = parse_int((recorded or {}).get("size_bytes"))
 
-        # Already complete on disk.
+        # Already complete on disk. A remuxed HLS file legitimately differs
+        # from the server's source size, so trust the recorded size too.
         if os.path.exists(dest):
             disk_size = os.path.getsize(dest)
-            if disk_size == expected:
+            if disk_size == expected or (recorded_size and disk_size == recorded_size):
                 if not recorded:
                     record(disk_size, 1)
                     return outcome("self_healed", disk_size, "recorded")
@@ -2112,19 +3226,69 @@ class DownloadEngine:
         reporter = ProgressReporter(progress_mode, self.downloads_path, expected, label)
         reporter.update(0, expected)
 
+        # HLS mode: short independent segments survive server resets and
+        # resume across runs. The stream is remuxed losslessly to MKV or MP4.
+        if str(self.settings.get("download_mode", "direct")).lower() == "hls":
+            try:
+                os.unlink(part)
+            except OSError:
+                pass
+            hls_retries = max(1, int(self.settings.get("max_retries", 3)))
+            last_hls_error = "unknown"
+            for attempt in range(1, hls_retries + 1):
+                try:
+                    hls_result = self._hls_download(
+                        episode_id, media_source_id, dest, expected, reporter, label,
+                        source=source,
+                    )
+                    actual = int(hls_result.get("size") or os.path.getsize(dest))
+                    reporter.finish("done")
+                    record(actual, attempt)
+                    return outcome("downloaded", actual, "hls")
+                except AuthError:
+                    raise
+                except ToolError as exc:
+                    last_hls_error = str(exc)
+                    if attempt < hls_retries:
+                        reporter.event(
+                            "retry",
+                            message=f"{label}: attempt {attempt}/{hls_retries} failed ({exc}); retrying in 5s...",
+                        )
+                        time.sleep(5)
+                except Exception as exc:  # noqa: BLE001 - keep the run alive
+                    last_hls_error = str(exc)
+                    if attempt < hls_retries:
+                        reporter.event(
+                            "retry",
+                            message=f"{label}: attempt {attempt}/{hls_retries} failed ({exc}); retrying in 5s...",
+                        )
+                        time.sleep(5)
+            reporter.finish("failed")
+            return outcome("failed", None, f"hls_error:{last_hls_error}")
+
+        max_retries = max(1, int(self.settings.get("max_retries", 5)))
+        stall_seconds = int(self.settings.get("speed_time_seconds", 60))
+        resume_stall = int(self.settings.get("resume_stall_seconds", 10))
+        resume_enabled = bool(self.settings.get("resume_enabled", True))
+        last_reason = "download_failed"
+
         # One short resume probe on an existing partial. Range requests can
-        # hang on this server, so never let the probe consume a full retry budget.
-        if (self.settings.get("resume_enabled", True) and os.path.exists(part)
+        # hang on some servers, so never let the probe consume a full retry
+        # budget; a partial that cannot be resumed is restarted fresh.
+        if (resume_enabled and os.path.exists(part)
                 and os.path.getsize(part) > 0):
             before = os.path.getsize(part)
-            reporter.event("resume", message=f"{label}: probing resume at {human_bytes(before)}")
+            reporter.event(
+                "resume",
+                message=f"{label}: probing resume at {human_bytes(before)}",
+            )
             probe = self._run_curl(
-                self.api.get_download_url(episode_id, media_source_id), part, resume=True,
-                stall_seconds=int(self.settings.get("resume_stall_seconds", 10)),
-                reporter=reporter,
+                self.api.get_download_url(episode_id, media_source_id), part,
+                resume=True, stall_seconds=resume_stall, reporter=reporter,
             )
             after = os.path.getsize(part) if os.path.exists(part) else 0
-            if probe["rc"] == 0 and after == expected and self._content_type_ok(probe["content_type"]):
+            if (probe["rc"] == 0 and after == expected
+                    and self._content_type_ok(probe["content_type"])):
                 os.replace(part, dest)
                 reporter.finish("done")
                 record(after, 1)
@@ -2132,16 +3296,13 @@ class DownloadEngine:
             reporter.event(
                 "retry",
                 message=(f"{label}: resume unusable (rc={probe['rc']}, "
-                         f"{human_bytes(before)}->{human_bytes(after)}); restarting fresh"),
+                         f"{human_bytes(before)}->{human_bytes(after)}); "
+                         f"restarting fresh"),
             )
             try:
                 os.unlink(part)
             except OSError:
                 pass
-
-        max_retries = max(1, int(self.settings.get("max_retries", 5)))
-        stall_seconds = int(self.settings.get("speed_time_seconds", 60))
-        last_reason = "download_failed"
 
         for attempt in range(1, max_retries + 1):
             ensure_disk_space(self.downloads_path, expected, self.config, label)
@@ -2150,10 +3311,10 @@ class DownloadEngine:
                 os.unlink(part)
             except OSError:
                 pass
-            ensure_disk_space(self.downloads_path, expected, self.config, label)
+            reporter.update(0, expected)
             result = self._run_curl(
-                self.api.get_download_url(episode_id, media_source_id), part, resume=False,
-                stall_seconds=stall_seconds, reporter=reporter,
+                self.api.get_download_url(episode_id, media_source_id), part,
+                resume=False, stall_seconds=stall_seconds, reporter=reporter,
             )
             actual = result["size"]
             http_code = result["http"]
@@ -2164,9 +3325,9 @@ class DownloadEngine:
                     f"Authentication failed while downloading {label} (HTTP {http_code})"
                 )
 
-            if result["rc"] == 0 and http_code in (200, 206) \
-                    and self._content_type_ok(result["content_type"]) \
-                    and actual == expected:
+            # Size is authoritative: this server drops the socket after the
+            # final byte, so a non-zero curl rc must not discard a full file.
+            if actual == expected:
                 os.replace(part, dest)
                 reporter.finish("done")
                 record(actual, attempt)
@@ -2251,36 +3412,163 @@ def execute_plan(plan: Dict[str, Any], api: EmbyAPI, dataset: DatasetManager,
     bytes_downloaded = 0
     failures: List[Dict[str, Any]] = []
 
-    with DownloadLock(get_downloads_path(config)):
-        for index, item in enumerate(items, start=1):
-            if not json_output:
-                info(f"--- [{index}/{len(items)}] {describe_item(item)} ---")
-            result = engine.download_item(
-                series["name"], series["id"], item, progress_mode=progress_mode,
-                source_spec=plan.get("source", "1"),
+    progress_state = {"completed": 0, "total": len(items), "stalled_for": 0}
+    stop_event = threading.Event()
+
+    def _periodic_notify():
+        interval = 600
+        settings = config.get("notifications") or {}
+        stall_after = max(120, int(settings.get("stall_alert_seconds", 300)))
+        last_notice = time.monotonic()
+        last_signature = None
+        last_change = time.monotonic()
+        stall_reported = None
+        while not stop_event.wait(30):
+            try:
+                st = read_state(get_downloads_path(config))
+                st = st if isinstance(st, dict) else {}
+                now = time.monotonic()
+                signature = (st.get("label"), st.get("downloaded"), st.get("status"))
+                if signature != last_signature:
+                    last_signature = signature
+                    last_change = now
+                    stall_reported = None
+                stalled_for = int(now - last_change)
+                progress_state["stalled_for"] = stalled_for
+                cur_label = st.get("label") or ""
+                cur_pct = st.get("percent")
+                pct_str = (f"{cur_pct:.1f}%" if isinstance(cur_pct, (int, float))
+                           else "—")
+                completed = progress_state["completed"]
+                total = progress_state["total"]
+                title = f"{PROG}: {series['name']}"
+                if stalled_for >= stall_after and signature != stall_reported:
+                    stall_reported = signature
+                    notify(
+                        config, title,
+                        f"No progress for {stalled_for // 60} min | "
+                        f"Completed: {completed}/{total} | "
+                        f"Current: {cur_label or '—'} ({pct_str})",
+                        urgency="critical",
+                    )
+                if now - last_notice >= interval:
+                    last_notice = now
+                    speed = st.get("speed_bps")
+                    speed_str = (f"{human_bytes(speed)}/s"
+                                 if isinstance(speed, (int, float)) else "—")
+                    eta = st.get("eta_seconds")
+                    if (eta is None or eta == 0) and isinstance(speed, (int, float)) and speed > 0:
+                        dl = st.get("downloaded")
+                        tot = st.get("total")
+                        if isinstance(dl, int) and isinstance(tot, int) and tot > dl:
+                            eta = int((tot - dl) / speed)
+                    eta_str = f" | ETA: {human_duration(eta)}" if eta is not None else ""
+                    message = (
+                        f"Completed: {completed}/{total} "
+                        f"(remaining: {max(0, total - completed)}) | "
+                        f"Current: {cur_label or '—'} ({pct_str}) | "
+                        f"Speed: {speed_str}{eta_str}"
+                    )
+                    notify(config, title, message)
+            except Exception:
+                pass
+
+    periodic_thread = None
+    if notify_summary:
+        periodic_thread = threading.Thread(target=_periodic_notify, daemon=True)
+        periodic_thread.start()
+
+    bot_thread = None
+    _tg_token = (config.get("notifications", {}) or {}).get("telegram_bot_token")
+    if _tg_token:
+        bot_thread = threading.Thread(
+            target=run_telegram_bot,
+            args=(config, progress_state, stop_event),
+            daemon=True,
+        )
+        bot_thread.start()
+
+    try:
+        with DownloadLock(get_downloads_path(config)):
+            pending_queue: collections.deque[Tuple[Dict[str, Any], int]] = collections.deque(
+                (item, 1) for item in items
             )
-            status = result["status"]
-            if status in ("downloaded", "self_healed"):
-                downloaded += 1
-                bytes_downloaded += int(result.get("size_bytes") or 0)
-            elif status == "skipped":
-                skipped += 1
-            else:
-                failed += 1
-                failures.append(result)
+            attempted_counter = 0
+            max_reschedule_rounds = max(1, int(config.get("download_settings", {}).get("queue_item_reschedule_rounds", 2)))
+
+            while pending_queue:
+                item, attempt_round = pending_queue.popleft()
+                attempted_counter += 1
                 if not json_output:
-                    warn(f">> FAILED: {result['relative_path']} ({result['reason']})")
-            if json_output:
-                emit_json_event(
-                    "verdict", status=status, reason=result.get("reason"),
-                    series=series["name"], season=result["season"],
-                    episode=result["episode"], episode_id=result.get("episode_id"),
-                    path=result["relative_path"], size_bytes=result.get("size_bytes"),
+                    round_str = f" [retry round {attempt_round}]" if attempt_round > 1 else ""
+                    info(f"--- [{attempted_counter}/{len(items)}] {describe_item(item)}{round_str} ---")
+                result = engine.download_item(
+                    series["name"], series["id"], item, progress_mode=progress_mode,
+                    source_spec=plan.get("source", "1"),
                 )
-            elif status == "skipped":
-                info(f">> SKIP (already downloaded): {result['relative_path']}")
-            elif status == "self_healed":
-                info(f">> File existed and matched; recorded in dataset: {result['relative_path']}")
+                status = result["status"]
+                if status in ("downloaded", "self_healed"):
+                    downloaded += 1
+                    bytes_downloaded += int(result.get("size_bytes") or 0)
+                elif status == "skipped":
+                    skipped += 1
+                else:
+                    if attempt_round < max_reschedule_rounds:
+                        pending_queue.append((item, attempt_round + 1))
+                        if not json_output:
+                            warn(f">> Rescheduled {result['relative_path']} to end of queue for retry ({result.get('reason') or 'failed'})")
+                        if notify_summary:
+                            notify(
+                                config,
+                                f"{PROG}: {series['name']}",
+                                f"S{result['season']:02d}E{result['episode']:02d} failed ({result.get('reason') or 'download_failed'}). Rescheduled to end of queue.",
+                            )
+                        continue
+                    else:
+                        failed += 1
+                        failures.append(result)
+                        if not json_output:
+                            warn(f">> FAILED: {result['relative_path']} ({result['reason']})")
+                progress_state["completed"] = downloaded + skipped
+                if notify_summary and status != "skipped":
+                    title = f"{PROG}: {series['name']}"
+                    completed = progress_state["completed"]
+                    total = progress_state["total"]
+                    if status in ("downloaded", "self_healed"):
+                        detail = ("already on disk" if status == "self_healed"
+                                  else human_bytes(result.get("size_bytes")))
+                        notify(
+                            config, title,
+                            f"Finished: S{result['season']:02d}E"
+                            f"{result['episode']:02d} ({detail}) | "
+                            f"Completed: {completed}/{total}",
+                        )
+                    else:
+                        notify(
+                            config, title,
+                            f"FAILED: S{result['season']:02d}E"
+                            f"{result['episode']:02d} "
+                            f"({result.get('reason') or 'download_failed'}) | "
+                            f"Completed: {completed}/{total}",
+                            urgency="critical",
+                        )
+                if json_output:
+                    emit_json_event(
+                        "verdict", status=status, reason=result.get("reason"),
+                        series=series["name"], season=result["season"],
+                        episode=result["episode"], episode_id=result.get("episode_id"),
+                        path=result["relative_path"], size_bytes=result.get("size_bytes"),
+                    )
+                elif status == "skipped":
+                    info(f">> SKIP (already downloaded): {result['relative_path']}")
+                elif status == "self_healed":
+                    info(f">> File existed and matched; recorded in dataset: {result['relative_path']}")
+    finally:
+        stop_event.set()
+        if periodic_thread is not None:
+            periodic_thread.join(timeout=2)
+        if bot_thread is not None:
+            bot_thread.join(timeout=2)
 
     if json_output:
         emit_json_event(
@@ -2294,7 +3582,7 @@ def execute_plan(plan: Dict[str, Any], api: EmbyAPI, dataset: DatasetManager,
             f"{failed} failed ({human_bytes(bytes_downloaded)}) ==="
         )
 
-    if notify_summary:
+    if notify_summary and len(items) > 1:
         settings = config.get("notifications", {})
         title = f"{PROG}: {series['name']}"
         message = (f"{downloaded} downloaded, {skipped} skipped, {failed} failed "
@@ -2305,6 +3593,450 @@ def execute_plan(plan: Dict[str, Any], api: EmbyAPI, dataset: DatasetManager,
             notify(config, title, message)
 
     return 0 if failed == 0 else 1
+
+
+# =============================================================================
+# QUEUE ENGINE
+# =============================================================================
+
+QUEUE_FILE_NAME = ".download_queue.json"
+QUEUE_STATE_NAME = ".queue_state.json"
+
+
+class QueueItem:
+    """A series item waiting in the download queue."""
+
+    def __init__(self, series: str, spec: Optional[List[str]] = None,
+                 series_id: Optional[str] = None, source: str = "1",
+                 include_specials: bool = False):
+        self.series = series.strip()
+        self.spec = list(spec) if spec else ["all"]
+        self.series_id = str(series_id) if series_id else None
+        self.source = str(source) if source else "1"
+        self.include_specials = bool(include_specials)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "series": self.series,
+            "spec": self.spec,
+            "series_id": self.series_id,
+            "source": self.source,
+            "include_specials": self.include_specials,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "QueueItem":
+        return cls(
+            series=data.get("series", ""),
+            spec=data.get("spec", ["all"]),
+            series_id=data.get("series_id"),
+            source=data.get("source", "1"),
+            include_specials=bool(data.get("include_specials", False)),
+        )
+
+    def __repr__(self) -> str:
+        spec_str = " ".join(self.spec) if self.spec else "all"
+        id_str = f" [id={self.series_id}]" if self.series_id else ""
+        return f"{self.series}{id_str} {spec_str}"
+
+
+def is_spec_token(token: str) -> bool:
+    t = token.strip().lower()
+    if t in ("all", "last", "missing", "new"):
+        return True
+    if _TOKEN_SE.match(token) or _TOKEN_S.match(token) or _TOKEN_E.match(token):
+        return True
+    return False
+
+
+def parse_series_and_spec_line(line: str) -> Optional[QueueItem]:
+    """Parse one line of text into a QueueItem."""
+    raw = line.strip()
+    if not raw or raw.startswith("#"):
+        return None
+
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        tokens = raw.split()
+
+    series_id = None
+    source = "1"
+    clean_tokens: List[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--series-id" and i + 1 < len(tokens):
+            series_id = tokens[i + 1]
+            i += 2
+            continue
+        if tok.startswith("--series-id="):
+            series_id = tok.split("=", 1)[1]
+            i += 1
+            continue
+        if tok == "--source" and i + 1 < len(tokens):
+            source = tokens[i + 1]
+            i += 2
+            continue
+        if tok.startswith("--source="):
+            source = tok.split("=", 1)[1]
+            i += 1
+            continue
+        clean_tokens.append(tok)
+        i += 1
+
+    if not clean_tokens:
+        return None
+
+    spec_tokens: List[str] = []
+    while clean_tokens and is_spec_token(clean_tokens[-1]):
+        spec_tokens.insert(0, clean_tokens.pop())
+
+    series_name = " ".join(clean_tokens).strip()
+    if (series_name.startswith('"') and series_name.endswith('"')) or \
+       (series_name.startswith("'") and series_name.endswith("'")):
+        series_name = series_name[1:-1].strip()
+
+    if not series_name:
+        return None
+
+    return QueueItem(
+        series=series_name,
+        spec=spec_tokens if spec_tokens else ["all"],
+        series_id=series_id,
+        source=source,
+    )
+
+
+def parse_queue_args(tokens: List[str]) -> List[QueueItem]:
+    """Parse a list of CLI tokens into a list of QueueItems."""
+    if not tokens:
+        return []
+
+    # Single argument containing comma or semicolon
+    if len(tokens) == 1 and (";" in tokens[0] or "," in tokens[0]):
+        delim = ";" if ";" in tokens[0] else ","
+        parts = [p.strip() for p in tokens[0].split(delim) if p.strip()]
+        items: List[QueueItem] = []
+        for part in parts:
+            qi = parse_series_and_spec_line(part)
+            if qi:
+                items.append(qi)
+        return items
+
+    # Group tokens by explicit delimiters (;, --, +)
+    groups: List[List[str]] = []
+    current_group: List[str] = []
+    for tok in tokens:
+        if tok in (";", "--", "+"):
+            if current_group:
+                groups.append(current_group)
+                current_group = []
+        elif tok.endswith(";") and len(tok) > 1:
+            current_group.append(tok[:-1])
+            groups.append(current_group)
+            current_group = []
+        elif tok.endswith(",") and len(tok) > 1:
+            current_group.append(tok[:-1])
+            groups.append(current_group)
+            current_group = []
+        else:
+            current_group.append(tok)
+    if current_group:
+        groups.append(current_group)
+
+    if len(groups) > 1:
+        items = []
+        for g in groups:
+            qi = parse_series_and_spec_line(" ".join(g))
+            if qi:
+                items.append(qi)
+        return items
+
+    # No delimiters: check if tokens contain multiple series
+    items = []
+    cur_series_words: List[str] = []
+    cur_specs: List[str] = []
+
+    def flush_item() -> None:
+        nonlocal cur_series_words, cur_specs
+        if cur_series_words:
+            s_name = " ".join(cur_series_words).strip()
+            if (s_name.startswith('"') and s_name.endswith('"')) or \
+               (s_name.startswith("'") and s_name.endswith("'")):
+                s_name = s_name[1:-1].strip()
+            if s_name:
+                items.append(QueueItem(
+                    series=s_name,
+                    spec=cur_specs if cur_specs else ["all"],
+                ))
+            cur_series_words = []
+            cur_specs = []
+
+    for tok in tokens:
+        if is_spec_token(tok):
+            cur_specs.append(tok)
+        else:
+            # If we already have specs, or if the current token has whitespace (was a quoted string)
+            # and we already have series words, flush the previous item!
+            if cur_specs:
+                flush_item()
+                cur_series_words.append(tok)
+            elif cur_series_words and (" " in tok or tok.startswith('"') or tok.startswith("'")):
+                flush_item()
+                cur_series_words.append(tok)
+            else:
+                cur_series_words.append(tok)
+    flush_item()
+    return items
+
+
+def load_queue_from_file(file_path: str) -> List[QueueItem]:
+    if not os.path.exists(file_path):
+        raise UsageError(f"Queue file not found: {file_path}")
+    items: List[QueueItem] = []
+    with open(file_path, "r", encoding="utf-8-sig", errors="replace") as handle:
+        for line in handle:
+            qi = parse_series_and_spec_line(line)
+            if qi:
+                items.append(qi)
+    return items
+
+
+def persistent_queue_file(downloads_path: str) -> str:
+    return os.path.join(downloads_path, QUEUE_FILE_NAME)
+
+
+def load_persistent_queue(downloads_path: str) -> List[QueueItem]:
+    path = persistent_queue_file(downloads_path)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, list):
+            return [QueueItem.from_dict(d) for d in data if isinstance(d, dict)]
+        return []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_persistent_queue(downloads_path: str, items: List[QueueItem]) -> None:
+    path = persistent_queue_file(downloads_path)
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump([item.to_dict() for item in items], handle,
+                      ensure_ascii=False, indent=2)
+    except OSError as exc:
+        raise ConfigError(f"Failed to save queue to {path}: {exc}")
+
+
+def update_queue_state(downloads_path: str, data: Dict[str, Any]) -> None:
+    path = os.path.join(downloads_path, QUEUE_STATE_NAME)
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def execute_queue(api: EmbyAPI, dataset: DatasetManager, config: Dict[str, Any],
+                  queue: List[QueueItem], progress_mode: str = "auto",
+                  json_output: bool = False, notify_summary: bool = True) -> int:
+    """Execute a list of QueueItems sequentially with queue-level state and error isolation."""
+    if not queue:
+        if not json_output:
+            info("Queue is empty.")
+        return 0
+
+    downloads_path = get_downloads_path(config)
+    total_series = len(queue)
+    start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if not json_output:
+        info(f"=== Queue: {total_series} series to process ===")
+
+    total_episodes_planned = 0
+    total_bytes_planned = 0
+    plans: List[Tuple[QueueItem, Optional[Dict[str, Any]]]] = []
+
+    for item in queue:
+        try:
+            series = api.resolve_series(item.series, item.series_id)
+            selection = parse_selection(item.spec)
+            source_spec = parse_source_spec(item.source)
+            plan = build_plan(api, dataset, config, series, selection,
+                              resolve_unknown_sizes=False, source_spec=source_spec,
+                              include_specials=item.include_specials)
+            plans.append((item, plan))
+            total_episodes_planned += plan["summary"]["total"]
+            total_bytes_planned += (plan["summary"].get("todo_bytes") or 0)
+        except Exception as exc:
+            plans.append((item, None))
+            warn(f"Warning: could not resolve {item.series}: {exc}")
+
+    if notify_summary:
+        notify(
+            config,
+            f"{PROG}: Queue Started",
+            f"Processing {total_series} series (~{human_bytes(total_bytes_planned)}, "
+            f"{total_episodes_planned} episodes).",
+        )
+
+    queue_completed_eps = 0
+    successful_series = 0
+    failed_series = 0
+
+    series_info_list = []
+    for it, p in plans:
+        summary = p.get("summary", {}) if p else {}
+        size_b = summary.get("total_bytes") or summary.get("todo_bytes")
+        series_info_list.append({
+            "name": it.series,
+            "spec": " ".join(it.spec),
+            "id": it.series_id or (p.get("series", {}).get("id") if p else ""),
+            "total": summary.get("total", 0) if p else len(it.spec),
+            "size_bytes": size_b if size_b else None,
+        })
+
+    for idx, (item, pre_plan) in enumerate(plans, start=1):
+        target_sids = [str(it.series_id) for it, _ in plans if it.series_id]
+        if not target_sids and pre_plan:
+            target_sids = [str(p.get("series", {}).get("id")) for _, p in plans if p]
+        update_queue_state(downloads_path, {
+            "running": True,
+            "current_index": idx,
+            "total_series": total_series,
+            "current_name": item.series,
+            "target_series_ids": target_sids,
+            "series_list": series_info_list,
+            "queue_completed_eps": queue_completed_eps,
+            "total_eps": total_episodes_planned,
+            "started_at": start_time,
+            "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+        if not json_output:
+            info(f"\n>>> [{idx}/{total_series}] Queue: {item.series} {' '.join(item.spec)}")
+
+        try:
+            series = api.resolve_series(item.series, item.series_id)
+            selection = parse_selection(item.spec)
+            source_spec = parse_source_spec(item.source)
+            plan = build_plan(api, dataset, config, series, selection,
+                              resolve_unknown_sizes=False, source_spec=source_spec,
+                              include_specials=item.include_specials)
+            rc = execute_plan(plan, api, dataset, config, progress_mode,
+                              json_output, notify_summary=notify_summary)
+            if rc == 0:
+                successful_series += 1
+            else:
+                failed_series += 1
+            queue_completed_eps += len(plan["items"])
+        except Exception as exc:
+            failed_series += 1
+            warn(f">> FAILED batch {item.series}: {exc}")
+            if notify_summary:
+                notify(
+                    config,
+                    f"{PROG}: Batch Alert",
+                    f"Series {item.series} encountered error: {exc}. Moving to next...",
+                    urgency="critical",
+                )
+
+    # Final sweep pass for any incomplete series in the queue
+    if failed_series > 0:
+        if not json_output:
+            info(f"\n{'='*70}\nRunning auto-retry sweep pass for {failed_series} incomplete series...\n{'='*70}")
+        for item, pre_plan in plans:
+            try:
+                series = api.resolve_series(item.series, item.series_id)
+                selection = parse_selection(item.spec)
+                source_spec = parse_source_spec(item.source)
+                plan = build_plan(api, dataset, config, series, selection,
+                                  resolve_unknown_sizes=False, source_spec=source_spec,
+                                  include_specials=item.include_specials)
+                if plan["summary"]["todo"] > 0:
+                    rc = execute_plan(plan, api, dataset, config, progress_mode,
+                                      json_output, notify_summary=notify_summary)
+                    if rc == 0:
+                        failed_series = max(0, failed_series - 1)
+                        successful_series += 1
+            except Exception:
+                pass
+
+    end_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    update_queue_state(downloads_path, {
+        "running": False,
+        "status": "completed",
+        "current_index": total_series,
+        "total_series": total_series,
+        "current_name": "Completed",
+        "queue_completed_eps": queue_completed_eps,
+        "total_eps": total_episodes_planned,
+        "started_at": start_time,
+        "ended_at": end_time,
+    })
+
+    if notify_summary:
+        summary_msg = (
+            f"Queue finished: {successful_series}/{total_series} series successful "
+            f"({failed_series} failed)."
+        )
+        notify(config, f"{PROG}: Queue Finished", summary_msg)
+
+    if not json_output:
+        info(f"\n=== Queue Finished: {successful_series}/{total_series} series OK, "
+             f"{failed_series} failed ===")
+
+    return 0 if failed_series == 0 else 1
+
+
+def plan_queue(api: EmbyAPI, dataset: DatasetManager, config: Dict[str, Any],
+               queue: List[QueueItem], json_output: bool = False) -> int:
+    """Show plan and total sizes for a queue of series."""
+    if not queue:
+        info("Queue is empty.")
+        return 0
+
+    grand_total_eps = 0
+    grand_todo_eps = 0
+    grand_total_bytes = 0
+    grand_todo_bytes = 0
+    series_plans = []
+
+    for it in queue:
+        try:
+            s = api.resolve_series(it.series, it.series_id)
+            plan = build_plan(api, dataset, config, s, parse_selection(it.spec),
+                              resolve_unknown_sizes=True, source_spec=it.source,
+                              include_specials=it.include_specials)
+            sm = plan["summary"]
+            grand_total_eps += sm["total"]
+            grand_todo_eps += sm["todo"]
+            grand_total_bytes += (sm.get("total_bytes") or 0)
+            grand_todo_bytes += (sm.get("todo_bytes") or 0)
+            series_plans.append(plan)
+            if not json_output:
+                info(f"  {s['Name']} [{' '.join(it.spec)}]: {sm['todo']}/{sm['total']} eps, {human_bytes(sm['todo_bytes'])}")
+        except Exception as exc:
+            warn(f"  {it.series}: error resolving plan ({exc})")
+
+    if json_output:
+        emit_json({
+            "queue_plans": series_plans,
+            "summary": {
+                "total_series": len(queue),
+                "total_episodes": grand_total_eps,
+                "todo_episodes": grand_todo_eps,
+                "total_bytes": grand_total_bytes,
+                "todo_bytes": grand_todo_bytes,
+            }
+        })
+        return 0
+
+    info(f"\nGrand Total: {grand_todo_eps}/{grand_total_eps} episodes to download ({human_bytes(grand_todo_bytes)})")
+    return 0
 
 
 # =============================================================================
@@ -2321,6 +4053,46 @@ def resolution_for(args: argparse.Namespace) -> List[str]:
 
 def cmd_download(args: argparse.Namespace, config: Dict[str, Any],
                  json_output: bool) -> int:
+    queue_file = getattr(args, "file", None)
+    series_list = getattr(args, "series_list", None) or []
+    series_arg = getattr(args, "series", None) or ""
+    has_delimiter = bool(series_arg and ("," in series_arg or ";" in series_arg))
+
+    if queue_file or series_list or has_delimiter or (not series_arg and not queue_file):
+        if not series_arg and not queue_file and not series_list:
+            raise UsageError("Missing series name (e.g. emby-dl download <series> [spec...]) or pass -f <queue_file>")
+        api = make_api(config)
+        dataset = DatasetManager(get_downloads_path(config))
+        queue: List[QueueItem] = []
+        if queue_file:
+            queue.extend(load_queue_from_file(queue_file))
+        if series_list:
+            for s in series_list:
+                qi = parse_series_and_spec_line(s)
+                if qi:
+                    queue.append(qi)
+        if has_delimiter:
+            delim = ";" if ";" in series_arg else ","
+            for part in series_arg.split(delim):
+                qi = parse_series_and_spec_line(part)
+                if qi:
+                    queue.append(qi)
+        if queue:
+            progress_mode = "json" if json_output else (getattr(args, "progress", None) or "auto")
+            if getattr(args, "notify", False):
+                config.setdefault("notifications", {})["desktop"] = True
+            webhook = getattr(args, "webhook", None)
+            if webhook:
+                config.setdefault("notifications", {})["webhook_url"] = webhook
+            notify_summary = bool(
+                getattr(args, "notify", False) or webhook
+                or config.get("notifications", {}).get("desktop")
+                or config.get("notifications", {}).get("webhook_url")
+                or config.get("notifications", {}).get("telegram_bot_token")
+            )
+            return execute_queue(api, dataset, config, queue, progress_mode,
+                                 json_output, notify_summary=notify_summary)
+
     api = make_api(config)
     series = api.resolve_series(args.series, getattr(args, "series_id", None))
     selection = parse_selection(resolution_for(args))
@@ -2355,6 +4127,7 @@ def cmd_download(args: argparse.Namespace, config: Dict[str, Any],
         getattr(args, "notify", False) or webhook
         or config.get("notifications", {}).get("desktop")
         or config.get("notifications", {}).get("webhook_url")
+        or config.get("notifications", {}).get("telegram_bot_token")
     )
     return execute_plan(plan, api, dataset, config, progress_mode,
                         json_output, notify_summary=notify_summary)
@@ -2362,6 +4135,32 @@ def cmd_download(args: argparse.Namespace, config: Dict[str, Any],
 
 def cmd_plan(args: argparse.Namespace, config: Dict[str, Any],
              json_output: bool) -> int:
+    queue_file = getattr(args, "file", None)
+    series_list = getattr(args, "series_list", None) or []
+    series_arg = getattr(args, "series", None) or ""
+    has_delimiter = bool(series_arg and ("," in series_arg or ";" in series_arg))
+
+    if queue_file or series_list or has_delimiter or (not series_arg and not queue_file):
+        if not series_arg and not queue_file and not series_list:
+            raise UsageError("Missing series name (e.g. emby-dl plan <series> [spec...]) or pass -f <queue_file>")
+        api = make_api(config)
+        dataset = DatasetManager(get_downloads_path(config))
+        queue: List[QueueItem] = []
+        if queue_file:
+            queue.extend(load_queue_from_file(queue_file))
+        if series_list:
+            for s in series_list:
+                qi = parse_series_and_spec_line(s)
+                if qi:
+                    queue.append(qi)
+        if has_delimiter:
+            delim = ";" if ";" in series_arg else ","
+            for part in series_arg.split(delim):
+                qi = parse_series_and_spec_line(part)
+                if qi:
+                    queue.append(qi)
+        return plan_queue(api, dataset, config, queue, json_output)
+
     api = make_api(config)
     series = api.resolve_series(args.series, getattr(args, "series_id", None))
     selection = parse_selection(resolution_for(args))
@@ -2412,6 +4211,132 @@ def cmd_plan(args: argparse.Namespace, config: Dict[str, Any],
         f"{human_bytes(summary['todo_bytes'])} to transfer"
     )
     return 0
+
+
+def cmd_queue(args: argparse.Namespace, config: Dict[str, Any],
+              json_output: bool) -> int:
+    api = make_api(config)
+    dataset = DatasetManager(get_downloads_path(config))
+    downloads_path = get_downloads_path(config)
+
+    action = getattr(args, "action", None) or "run"
+    tokens = getattr(args, "items", []) or []
+    queue_file = getattr(args, "file", None)
+
+    # 1. Action: add
+    if action == "add":
+        if not tokens:
+            raise UsageError("queue add requires a series name (e.g. emby-dl queue add 'Show' S1)")
+        items = parse_queue_args(tokens)
+        if not items:
+            raise UsageError("Could not parse series name from arguments.")
+        curr = load_persistent_queue(downloads_path)
+        for it in items:
+            if getattr(args, "series_id", None):
+                it.series_id = args.series_id
+            if getattr(args, "source", None):
+                it.source = args.source
+            curr.append(it)
+        save_persistent_queue(downloads_path, curr)
+        if not json_output:
+            for it in items:
+                info(f"Added to queue: {it}")
+            info(f"Persistent queue now contains {len(curr)} item(s).")
+        return 0
+
+    # 2. Action: list
+    if action == "list":
+        curr = load_persistent_queue(downloads_path)
+        if json_output:
+            emit_json([it.to_dict() for it in curr])
+            return 0
+        if not curr:
+            info("Queue is empty. Add series with: emby-dl queue add <series> [spec...]")
+            return 0
+        info(f"=== Persistent Queue ({len(curr)} items) ===")
+        for idx, it in enumerate(curr, start=1):
+            id_str = f" (id={it.series_id})" if it.series_id else ""
+            info(f"  [{idx}] {it.series}{id_str} {' '.join(it.spec)}")
+        info("\nRun queue with: emby-dl queue run")
+        return 0
+
+    # 3. Action: clear
+    if action == "clear":
+        save_persistent_queue(downloads_path, [])
+        if not json_output:
+            info("Persistent queue cleared.")
+        return 0
+
+    # 4. Action: remove
+    if action == "remove":
+        if not tokens:
+            raise UsageError("queue remove requires an index (e.g. emby-dl queue remove 1)")
+        try:
+            remove_idx = int(tokens[0]) - 1
+        except ValueError:
+            raise UsageError(f"Invalid index: {tokens[0]!r}")
+        curr = load_persistent_queue(downloads_path)
+        if 0 <= remove_idx < len(curr):
+            removed = curr.pop(remove_idx)
+            save_persistent_queue(downloads_path, curr)
+            if not json_output:
+                info(f"Removed [{remove_idx + 1}] {removed.series} from queue.")
+        else:
+            raise UsageError(f"Index {remove_idx + 1} out of range (1..{len(curr)})")
+        return 0
+
+    # 5. Action: plan
+    if action == "plan":
+        queue: List[QueueItem] = []
+        if queue_file:
+            queue.extend(load_queue_from_file(queue_file))
+        if tokens:
+            queue.extend(parse_queue_args(tokens))
+        if not queue:
+            queue = load_persistent_queue(downloads_path)
+        if not queue:
+            info("Queue is empty. Specify series or a file to plan.")
+            return 0
+        return plan_queue(api, dataset, config, queue, json_output)
+
+    # 6. Action: run or direct execution
+    queue = []
+    if queue_file:
+        queue.extend(load_queue_from_file(queue_file))
+    if action not in ("run", "add", "list", "clear", "remove", "plan"):
+        all_tokens = [action] + tokens
+        queue.extend(parse_queue_args(all_tokens))
+    elif tokens:
+        queue.extend(parse_queue_args(tokens))
+
+    is_persistent = False
+    if not queue:
+        queue = load_persistent_queue(downloads_path)
+        is_persistent = True
+
+    if not queue:
+        info("Queue is empty. Pass series names, use -f <file>, or add with 'emby-dl queue add'.")
+        return 0
+
+    progress_mode = "json" if json_output else (getattr(args, "progress", None) or "auto")
+    if getattr(args, "notify", False):
+        config.setdefault("notifications", {})["desktop"] = True
+    webhook = getattr(args, "webhook", None)
+    if webhook:
+        config.setdefault("notifications", {})["webhook_url"] = webhook
+
+    notify_summary = bool(
+        getattr(args, "notify", False) or webhook
+        or config.get("notifications", {}).get("desktop")
+        or config.get("notifications", {}).get("webhook_url")
+        or config.get("notifications", {}).get("telegram_bot_token")
+    )
+
+    rc = execute_queue(api, dataset, config, queue, progress_mode,
+                       json_output, notify_summary=notify_summary)
+    if is_persistent and rc == 0:
+        save_persistent_queue(downloads_path, [])
+    return rc
 
 
 def _parse_iso(value: Optional[str]) -> Optional[datetime.datetime]:
@@ -2674,6 +4599,7 @@ def cmd_watch(args: argparse.Namespace, config: Dict[str, Any],
         getattr(args, "notify", False) or webhook
         or config.get("notifications", {}).get("desktop")
         or config.get("notifications", {}).get("webhook_url")
+        or config.get("notifications", {}).get("telegram_bot_token")
     )
 
     if not json_output:
@@ -2920,10 +4846,14 @@ def cmd_config(args: argparse.Namespace, config: Dict[str, Any],
     if safe.get("access_token"):
         safe["access_token"] = "***hidden***"
     notifications = safe.get("notifications")
-    if isinstance(notifications, dict) and notifications.get("webhook_url"):
-        notifications = dict(notifications)
-        notifications["webhook_url"] = "***hidden***"
-        safe["notifications"] = notifications
+    if isinstance(notifications, dict):
+        masked = dict(notifications)
+        if masked.get("webhook_url"):
+            masked["webhook_url"] = "***hidden***"
+        if masked.get("telegram_bot_token"):
+            masked["telegram_bot_token"] = "***hidden***"
+        if masked != notifications:
+            safe["notifications"] = masked
     if json_output:
         emit_json({"config_path": config.get("_config_path"), "config": safe})
         return 0
@@ -3204,6 +5134,23 @@ def run_doctor(config: Dict[str, Any], json_output: bool,
                 record("server_reachable", False, "unreachable", str(exc))
                 record("token_valid", False, "unknown", "server unreachable")
 
+    # 10. Telegram Bot integration (if configured)
+    bot_token = (config.get("notifications") or {}).get("telegram_bot_token") or ""
+    chat_id = (config.get("notifications") or {}).get("telegram_chat_id") or ""
+    if bot_token and network:
+        me = telegram_api(bot_token, "getMe", timeout=5)
+        bot_ok = bool(me.get("ok"))
+        bot_user = me.get("result", {}).get("username")
+        record("telegram_bot", bot_ok,
+               f"@{bot_user}" if bot_ok else "unauthorized",
+               "ok" if bot_ok else "invalid telegram_bot_token")
+        if bot_ok and chat_id:
+            record("telegram_chat", True, f"id={chat_id}", "ok")
+        elif bot_ok:
+            record("telegram_chat", True, "not registered", "send /start to bot to register")
+    elif bot_token:
+        record("telegram_bot", True, "configured", "offline check skipped")
+
     failed = [c for c in checks if not c["ok"]]
     payload = {
         "tool_version": VERSION,
@@ -3240,13 +5187,14 @@ def cmd_doctor(args: argparse.Namespace, config: Dict[str, Any],
 
 KNOWN_COMMANDS = {
     "search", "list", "dataset", "config", "download", "plan", "status",
-    "verify", "watch", "auth", "login", "doctor", "init",
+    "verify", "watch", "auth", "login", "doctor", "init", "queue",
 }
 GLOBAL_VALUE_FLAGS = {"--config", "-c", "--downloads-dir"}
 GLOBAL_BOOL_FLAGS = {"--json"}
 VALUE_FLAGS = {
     "--series-id", "--progress", "--interval", "--webhook",
     "--username", "--password", "--limit", "--source", "--server-url",
+    "--file", "-f", "--series",
 }
 ALL_VALUE_FLAGS = GLOBAL_VALUE_FLAGS | VALUE_FLAGS
 KNOWN_FLAGS = ALL_VALUE_FLAGS | {
@@ -3317,6 +5265,109 @@ def normalize_argv(argv: List[str]) -> List[str]:
     return globals_out + [command] + sub_options + positionals
 
 
+def print_queue_action_help(action: str) -> None:
+    action = action.lower()
+    if action == "add":
+        print(f"""usage: {PROG} queue add <series> [spec...] [options]
+
+Add a series and optional episode selection to the persistent download queue.
+
+positional arguments:
+  series                Series name or search query
+  spec                  Episode spec: all, S<N>, E<M>, S<N> E<M>-<K>, etc. (default: all)
+
+options:
+  --series-id ID        Explicit Emby series ID (bypasses name ambiguity)
+  --source SOURCE       Media source version: 1 (default), N, or max
+  --include-specials    Include season 0 / specials when using 'all'
+
+examples:
+  {PROG} queue add "Black Clover"
+  {PROG} queue add "Black Clover" S1
+  {PROG} queue add "One Piece" S2 E1-10
+  {PROG} queue add "Bleach" all --source max
+  {PROG} queue add "Attack on Titan" S4 --series-id 12345
+""")
+    elif action == "list":
+        print(f"""usage: {PROG} queue list [--json]
+
+Display all series and episode ranges currently waiting in the persistent queue.
+
+options:
+  --json                Output queue entries as a machine-readable JSON array
+
+examples:
+  {PROG} queue list
+  {PROG} queue list --json
+""")
+    elif action == "run":
+        print(f"""usage: {PROG} queue run [options]
+
+Execute all series in the persistent download queue sequentially.
+Completed items are automatically removed from the queue on success.
+Failed episodes are automatically rescheduled to the end of the queue.
+
+options:
+  --progress {{auto,plain,json,none}}  Progress rendering mode
+  --notify                           Desktop and Telegram notification on batch completion
+  --webhook URL                      POST a completion webhook (Telegram-ready)
+  --json                             Machine-readable JSON Lines output
+
+examples:
+  {PROG} queue run
+  {PROG} queue run --notify
+  {PROG} queue run --progress plain
+""")
+    elif action == "plan":
+        print(f"""usage: {PROG} queue plan [series...] [-f FILE] [--json]
+
+Calculate and preview the download plan, episode counts, and total storage
+required for a queue of series without downloading anything.
+
+If no series or file is given, plans the items currently in the persistent queue.
+
+options:
+  -f, --file FILE       Read queue items from a text file
+  --json                Output detailed per-series plans as machine-readable JSON
+
+examples:
+  {PROG} queue plan "Show A" "Show B"
+  {PROG} queue plan "Show A" S1 ; "Show B" all
+  {PROG} queue plan -f my_shows.txt
+  {PROG} queue plan                     # Plans the persistent queue
+""")
+    elif action == "remove":
+        print(f"""usage: {PROG} queue remove <index>
+
+Remove a queued series by its 1-based index (as displayed in '{PROG} queue list').
+
+positional arguments:
+  index                 1-based item number to remove
+
+examples:
+  {PROG} queue remove 1                 # Remove the first series in queue
+  {PROG} queue remove 3                 # Remove the third series in queue
+""")
+    elif action == "clear":
+        print(f"""usage: {PROG} queue clear
+
+Empty all series from the persistent download queue.
+
+examples:
+  {PROG} queue clear
+""")
+
+
+def handle_queue_subhelp(argv: List[str]) -> bool:
+    """Print specialized help for queue subactions when --help or -h is passed."""
+    if len(argv) >= 2 and argv[0] == "queue":
+        action = argv[1].lower()
+        if action in ("add", "list", "run", "remove", "clear", "plan") and any(h in argv[2:] for h in ("-h", "--help")):
+            print_queue_action_help(action)
+            return True
+    return False
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG,
@@ -3328,6 +5379,11 @@ Examples:
   %(prog)s "Black Clover" all             # All episodes of all real seasons
   %(prog)s "Black Clover" S2 E3           # Season 2, episode 3
   %(prog)s "Black Clover" S2 E1-4         # Season 2, episodes 1-4
+  %(prog)s queue "Show A" "Show B"        # Download multiple series in one command
+  %(prog)s queue "Show A" S1 ; "Show B"   # Download with per-series specs (using ';')
+  %(prog)s queue -f shows.txt             # Download all series listed in a file
+  %(prog)s queue add "Show" S1            # Add to persistent queue
+  %(prog)s queue run                      # Run persistent queue
   %(prog)s plan "Black Clover" S2         # Show what would happen, download nothing
   %(prog)s status                         # Live progress of a running download
   %(prog)s verify "Black Clover" --fix    # Check files and repair problems
@@ -3354,9 +5410,24 @@ Exit codes: 0 ok, 1 failed, 2 not found, 3 config/auth/server,
         command_parser.add_argument("--json", action="store_true", dest="json_sub",
                                     help="Machine-readable output")
 
-    download = sub.add_parser("download", help="Download episodes")
-    download.add_argument("series")
+    download = sub.add_parser(
+        "download",
+        help="Download episodes (single series, queue file, or list)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s "Black Clover" S1 E1-5
+  %(prog)s "Black Clover" all --source max
+  %(prog)s -f shows.txt                              # Download multiple series from a file
+  %(prog)s "Show A, Show B, Show C"                  # Download comma-separated series
+  %(prog)s --series "Show A" --series "Show B"
+        """,
+    )
+    download.add_argument("series", nargs="?")
     download.add_argument("spec", nargs="*")
+    download.add_argument("-f", "--file", help="Download multiple series from a queue file")
+    download.add_argument("--series", action="append", dest="series_list",
+                          help="Additional series to queue for download")
     download.add_argument("--series-id")
     download.add_argument("--source", default="1",
                           help="Media source to download: 1 (default), N, or max")
@@ -3368,15 +5439,82 @@ Exit codes: 0 ok, 1 failed, 2 not found, 3 config/auth/server,
     download.add_argument("--webhook", help="POST a completion webhook (Telegram-ready)")
     add_json(download)
 
-    plan = sub.add_parser("plan", help="Resolve selection and show what would download")
-    plan.add_argument("series")
+    plan = sub.add_parser(
+        "plan",
+        help="Resolve selection and show what would download",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s "Black Clover" S1 E1-5
+  %(prog)s -f shows.txt                              # Plan multiple series from a file
+  %(prog)s "Show A, Show B"
+        """,
+    )
+    plan.add_argument("series", nargs="?")
     plan.add_argument("spec", nargs="*")
+    plan.add_argument("-f", "--file", help="Plan multiple series from a queue file")
+    plan.add_argument("--series", action="append", dest="series_list",
+                      help="Additional series to queue for planning")
     plan.add_argument("--series-id")
     plan.add_argument("--source", default="1",
                       help="Media source to plan for: 1 (default), N, or max")
     plan.add_argument("--include-specials", action="store_true",
                       help="With 'all': also include season 0 / specials")
     add_json(plan)
+
+    queue_cmd = sub.add_parser(
+        "queue",
+        help="Manage and run multi-series download queues",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""
+Manage and execute multi-series download queues.
+
+Supports direct multi-series execution, text-file batch queues,
+and a persistent queue with add / list / run / remove / clear actions.
+Failed episodes are automatically rescheduled to the end of the queue.
+""",
+        epilog="""
+Actions:
+  add <series> [spec...]       Add series and episode spec to persistent queue
+  list                         View all series in the persistent queue
+  run                          Download all series in the persistent queue
+  remove <index>               Remove a series from queue by 1-based index
+  clear                        Empty the persistent queue
+  plan [items...] [-f file]    Calculate sizes and plan queue without downloading
+
+Direct Queue Execution:
+  %(prog)s "Show A" "Show B" "Show C"            # Download multiple series
+  %(prog)s "Show A" S1 ; "Show B" all            # With per-series specs (using ';')
+  %(prog)s "Show A" S1 -- "Show B" all           # Delimited by '--'
+  %(prog)s -f shows.txt                          # Download from file
+
+Persistent Queue Lifecycle:
+  %(prog)s add "Black Clover" S1                 # Add Season 1
+  %(prog)s add "One Piece" S2 all                # Add Season 2 All
+  %(prog)s add "Bleach" all --source max         # Add with max quality
+  %(prog)s list                                  # List queued items
+  %(prog)s plan                                  # Preview queue plan
+  %(prog)s run                                   # Start downloading
+  %(prog)s remove 2                              # Remove item #2
+  %(prog)s clear                                 # Clear queue
+
+Subcommand Help:
+  Run '%(prog)s <action> --help' for detailed help on any action
+  (e.g. '%(prog)s add --help', '%(prog)s plan --help').
+""",
+    )
+    queue_cmd.add_argument("action", nargs="?",
+                           help="Action (add, list, run, clear, remove, plan) or series name")
+    queue_cmd.add_argument("items", nargs="*",
+                           help="Series names, episode specs, or action arguments")
+    queue_cmd.add_argument("-f", "--file", help="Path to text file containing series list")
+    queue_cmd.add_argument("--series-id", help="Explicit series ID")
+    queue_cmd.add_argument("--source", default="1", help="Media source: 1, N, or max")
+    queue_cmd.add_argument("--include-specials", action="store_true")
+    queue_cmd.add_argument("--progress", choices=["auto", "plain", "json", "none"])
+    queue_cmd.add_argument("--notify", action="store_true", help="Desktop/Telegram notification")
+    queue_cmd.add_argument("--webhook", help="Webhook URL")
+    add_json(queue_cmd)
 
     status = sub.add_parser("status", help="Show live download progress")
     add_json(status)
@@ -3463,6 +5601,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"{PROG} {VERSION}")
         return 0
 
+    if handle_queue_subhelp(argv):
+        return 0
+
     json_hint = "--json" in argv
     try:
         argv = normalize_argv(argv)
@@ -3500,6 +5641,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return cmd_init(args, config, json_output)
         if args.command == "download":
             return cmd_download(args, config, json_output)
+        if args.command == "queue":
+            return cmd_queue(args, config, json_output)
         if args.command == "plan":
             return cmd_plan(args, config, json_output)
         if args.command == "status":

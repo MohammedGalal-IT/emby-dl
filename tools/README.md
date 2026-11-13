@@ -81,6 +81,7 @@ The real config is `config.json` at the project root and must be mode `600`.
   "username": "دخول الاستراحة 2",
   "downloads_path": "./downloads",
   "download_settings": {
+    "download_mode": "hls",
     "speed_limit_bytes": 5000,
     "speed_time_seconds": 60,
     "max_retries": 5,
@@ -89,6 +90,10 @@ The real config is `config.json` at the project root and must be mode `600`.
     "retry_backoff_max_seconds": 600,
     "resume_enabled": true,
     "resume_stall_seconds": 10,
+    "hls_workers": 4,
+    "hls_segment_retries": 4,
+    "ffmpeg_path": "ffmpeg",
+    "queue_item_reschedule_rounds": 2,
     "disk_reserve_bytes": 2147483648,
     "api_timeout_seconds": 20,
     "api_retries": 1,
@@ -97,6 +102,7 @@ The real config is `config.json` at the project root and must be mode `600`.
   "notifications": {
     "desktop": false,
     "webhook_url": "",
+    "telegram_bot_token": "",
     "telegram_chat_id": "",
     "notify_on_start": false,
     "notify_on_complete": true,
@@ -116,14 +122,19 @@ the CWD in that case).
 
 | Key | Default | Meaning |
 |---|---:|---|
+| `download_mode` | `"hls"` | `"hls"` (resilient segment download + lossless remux) or `"direct"` (single HTTP stream) |
 | `speed_limit_bytes` | `5000` | stall threshold, **not** a bandwidth cap |
 | `speed_time_seconds` | `60` | how long a transfer may stay under the threshold before curl aborts |
 | `max_retries` | `5` | fresh-download attempts per file |
 | `retry_delay_seconds` | `5` | legacy pause value (kept for compatibility) |
 | `retry_backoff_initial_seconds` | `15` | first health-gated backoff: 15 → 30 → 60 → 120 … |
 | `retry_backoff_max_seconds` | `600` | backoff cap; the tool waits for `/System/Info/Public` before retrying |
-| `resume_enabled` | `true` | attempt one short Range probe on an existing `.part` |
+| `resume_enabled` | `true` | attempt one short Range probe on an existing `.part` in direct mode |
 | `resume_stall_seconds` | `10` | short stall window for that probe |
+| `hls_workers` | `4` | concurrent curl worker threads downloading independent HLS segments (1–8) |
+| `hls_segment_retries` | `4` | retry attempts per failed HLS segment before refreshing session |
+| `ffmpeg_path` | `"ffmpeg"` | path to ffmpeg executable for lossless remuxing |
+| `queue_item_reschedule_rounds` | `2` | automatic failure rescheduling rounds before marking an episode failed |
 | `disk_reserve_bytes` | `2147483648` | free space kept untouched (2 GiB) |
 | `api_timeout_seconds` | `20` | JSON API request timeout |
 | `api_retries` | `1` | API retries after an HTTP 5xx or connection error |
@@ -133,16 +144,15 @@ the CWD in that case).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `desktop` | `false` | call `notify-send` (uses `DISPLAY`, default `:0`) |
+| `desktop` | `false` | desktop notifications (PowerShell balloon tips on Windows, `notify-send` on Linux) |
 | `webhook_url` | `""` | POST a JSON body when a batch finishes |
-| `telegram_chat_id` | `""` | required when the webhook is a Telegram bot URL |
-| `notify_on_start` | `false` | reserved; batches currently notify on finish |
+| `telegram_bot_token` | `""` | Telegram bot token (enables alerts and interactive two-way bot commands) |
+| `telegram_chat_id` | `""` | target chat ID for Telegram messages |
+| `notify_on_start` | `false` | notify on queue/batch start |
 | `notify_on_complete` | `true` | notify when a batch has no failures |
 | `notify_on_failure` | `true` | notify when at least one item fails |
 
-Telegram is auto-detected when the URL contains `api.telegram.org`; the payload
-becomes `{"chat_id": "...", "text": "title\nmessage"}`. Any other URL receives
-`{"title": ..., "text": ..., "message": ...}`.
+Telegram is supported both via webhook and via native bot integration (`telegram_bot_token` + `telegram_chat_id`). When `telegram_bot_token` is configured, a background bot thread automatically responds to `/status`, `/help`, and `/ping` commands in Telegram with live progress and ETA.
 
 `--notify` enables desktop notifications for one run. `--webhook URL` overrides the
 webhook for one run. Neither changes the config file.
@@ -176,8 +186,9 @@ Manual fallback: log into the Emby web UI → DevTools → Application → Local
 
 | Command | Purpose |
 |---|---|
-| `download` | download a selection (default when the first token is not a command) |
-| `plan` | resolve the selection, show sizes/skips/sources, download nothing |
+| `download` | download a selection (supports single series, queue file, or comma-separated list) |
+| `queue` | manage and execute multi-series download queues (`add`, `list`, `run`, `remove`, `clear`, `plan`) |
+| `plan` | resolve the selection, show sizes/skips/sources, download nothing (supports `-f <queue_file>`) |
 | `status` | live progress + PID of the running download |
 | `verify [series]` | compare every recorded file with the server (`--fix` repairs) |
 | `watch` | poll a series and download new/missing episodes (`--once` for one pass) |
@@ -193,9 +204,10 @@ Global options (`--config`, `--downloads-dir`, `--json`) are accepted before or
 after the subcommand and are hoisted to the front. Any subcommand option may also
 appear before, between or after positionals: `plan "Show" --series-id 1 S2` and
 `plan --series-id 1 "Show" S2` are equivalent. `--series-id` belongs to the
-selection commands (`download`, `plan`, `list`, `verify`, `watch`).
-`--source` belongs to `download`, `plan`, and `watch`.
-`--include-specials` belongs to `download`, `plan`, and `watch` when using `all`.
+selection commands (`download`, `plan`, `queue`, `list`, `verify`, `watch`).
+`--source` belongs to `download`, `plan`, `queue`, and `watch`.
+`--include-specials` belongs to `download`, `plan`, `queue`, and `watch` when using `all`.
+`-f` / `--file` belongs to `download`, `plan`, and `queue`.
 
 ---
 
@@ -245,7 +257,7 @@ tools/emby_dl "اسطنبول راساً على عقب" missing
 tools/emby_dl "Black Clover" --series-id 276491 S2
 ```
 
-### 3.4 Multi-version media source selection (`--source`)
+### 3.3 Multi-version media source selection (`--source`)
 
 When episodes have multiple versions (e.g., 480p, 1080p, 4K Remux), the `--source` option
 controls which version is targeted:
@@ -265,33 +277,82 @@ tools/emby_dl "Alpha Show" S1 E1 --source 2
 tools/emby_dl plan "Alpha Show" all --source max
 ```
 
-### 3.5 Ambiguity refusal and `--series-id`
+### 3.4 Direct Series ID Support (`--series-id`) & Smart Resolution Cache
 
-Some names exist more than once. The live server currently returns:
+Some series names exist more than once on the server (e.g., reboots, alternate releases).
+For example, the home server returns:
 
 ```text
 114002  Black Clover
 276491  Black Clover
 ```
 
-The tool **refuses to guess** and exits `4`, listing candidates. Pick one:
+The tool **refuses to guess** and exits `4`, listing all candidates. When you provide `--series-id`,
+it bypasses full-library search entirely, querying `/Items/{id}` directly in **0.03 seconds**.
+
+#### 3.4.1 Universal `--series-id` Support Across All Input Patterns
+
+`--series-id` is a first-class citizen supported in every input mode:
 
 ```bash
-tools/emby_dl list "Black Clover" --series-id 276491
-tools/emby_dl "Black Clover" --series-id 276491 S2 E3
+# 1. Single Download / Bare Form
+emby-dl "Black Clover" S2 E3 --series-id 276491
+emby-dl download "Black Clover" all --series-id 276491
+
+# 2. Dry-Run Planning
+emby-dl plan "Black Clover" all --series-id 276491
+
+# 3. Persistent Queue Management
+emby-dl queue add "Black Clover" S1 --series-id 276491
+emby-dl queue add "Attack on Titan" S4 --series-id 12345 --source max
+
+# 4. Direct Multi-Series CLI Queue
+emby-dl queue "Show A" S1 --series-id 111 ; "Show B" all --series-id 222
+
+# 5. Queue Text Files (-f / --file)
+# Inline --series-id can be specified directly on any line:
+#   Black Clover S1 --series-id 276491
+#   One Piece S2 all --series-id 99881 --source max
+
+# 6. Maintenance & Inspection Commands
+emby-dl list "Black Clover" --series-id 276491
+emby-dl verify "Black Clover" --series-id 276491 --fix
+emby-dl watch "Black Clover" --series-id 276491 --interval 600
 ```
 
-`--series-id` also bypasses the search request entirely (faster and stable).
+#### 3.4.2 Automatic Smart Series Resolution Cache (`SeriesCache`)
 
-Rules:
+To ensure maximum performance without requiring users to manually look up and specify
+`--series-id` every time, `emby-dl` includes an automatic, persistent **Series Resolution Cache**
+(`<downloads>/.emby_series_cache.json`):
 
-- exactly one exact name match → use it
-- one search result → use it
-- more than one exact match, or several fuzzy results → exit `4` with candidates
-- no results → exit `2`
+1. **Automatic Seeding from Dataset:**
+   The cache automatically seeds itself from `downloaded_dataset.json`. Any series you have
+   ever downloaded is instantly known to the cache.
+2. **Instant Verification (0.02s Lookup):**
+   When you request a series by title (e.g., `emby-dl queue "الطبيب المعجزة"`), the tool checks
+   the local cache first. If found, it verifies the cached ID with a lightweight `/Items/{id}`
+   call in **0.02 seconds**, completely skipping the heavy, database-wide `/Items?SearchTerm=...`
+   scan on the server.
+3. **Continuous Self-Learning:**
+   Whenever any series is resolved (via search or explicit `--series-id`), the mapping
+   `normalized_name -> series_id` is automatically committed to `.emby_series_cache.json`.
+   Subsequent commands resolve instantly with zero search overhead.
+4. **Search Timeout Immunity:**
+   Because Emby 4.x servers under transcode load can stall or timeout on full-text search queries,
+   the Smart Cache eliminates the root cause of search timeouts for all known series.
+
+Resolution Rules:
+
+- `--series-id` specified → verify item is Series and use directly (0.03s)
+- Name cached locally → verify cached ID and use directly (0.02s)
+- Exactly one exact name match on server → use it and cache for future runs
+- Exactly one search result on server → use it and cache for future runs
+- Multiple matches / ambiguous results → exit `4` with candidates list
+- No results found → exit `2`
 - `--series-id` pointing at a non-Series item → exit `4`
 
-### 3.4 `plan` — dry run before spending hours
+### 3.5 `plan` — dry run before spending hours
 
 ```bash
 tools/emby_dl plan "في السابعة عشر" S1 E19-23
@@ -328,7 +389,222 @@ not report a size; the download will fail rather than trust it).
 
 `plan` never creates a file and never takes the download lock.
 
-### 3.5 What happens during a download
+---
+
+### 3.6 Multi-Series Queue System (`queue` and `-f / --file`)
+
+`emby-dl` provides official, hardened multi-series queue management. You can download or plan
+dozens of series in a single command, from a text file, or by building a persistent queue.
+
+#### 3.6.1 Direct Command-Line Queues
+
+Multiple series can be specified directly on the command line:
+
+```bash
+# Download multiple series in one command (downloads 'all' real seasons by default)
+emby-dl queue "فنون سارا The Art of Sarah" "The Flower of Evil - زهرة الشر" "لعبة الهرم Pyramid Game"
+
+# Download with per-series episode ranges using ';' as delimiter
+emby-dl queue "Show A" S1 ; "Show B" all ; "Show C" S2 E1-5
+
+# Double-dash '--' can also be used as a delimiter between series
+emby-dl queue "Show A" S1 E1-5 -- "Show B" all -- "Show C" S2
+
+# Comma-separated list with 'download' command
+emby-dl download "Show A, Show B, Show C"
+```
+
+#### 3.6.2 File-Based Queues (`-f / --file`)
+
+For long queues or automated tasks, pass a text file containing series names and specs:
+
+```bash
+# Execute queue from a text file
+emby-dl queue -f queue.txt
+emby-dl download -f queue.txt
+
+# Preview / dry-run plan for an entire queue file
+emby-dl queue plan -f queue.txt
+emby-dl plan -f queue.txt
+```
+
+**Queue File Syntax Rules (`queue.txt`):**
+- One series per line.
+- Blank lines and comment lines starting with `#` are automatically ignored.
+- UTF-8 BOM (`\ufeff`) is automatically stripped (PowerShell / Windows safe).
+- Any trailing spec tokens (`S1`, `all`, `E1-10`, `S2 E5-last`) are parsed as the episode selection.
+- Supports inline `--series-id <id>` and `--source <source>` options per line.
+
+*Example `queue.txt`:*
+```text
+# Morning batch
+فنون سارا The Art of Sarah
+The Flower of Evil - زهرة الشر S1 E1-10
+انت من احب S1 E21-23 --source max
+المدينة البعيدة S2 E27-35 --series-id 145070
+المدينة البعيدة S3 all --series-id 145070
+```
+
+#### 3.6.3 Persistent Queue Management
+
+Build a queue incrementally and run it whenever ready. The queue is stored atomically
+in `<downloads>/.download_queue.json`.
+
+| Action | Command | Purpose |
+|---|---|---|
+| `add` | `emby-dl queue add <series> [spec...]` | Add a series and spec to the queue |
+| `list` | `emby-dl queue list [--json]` | View waiting items with 1-based indices |
+| `run` | `emby-dl queue run [options]` | Execute the queue sequentially |
+| `plan` | `emby-dl queue plan` | Dry-run plan for all queued items |
+| `remove` | `emby-dl queue remove <index>` | Remove a series by its 1-based index |
+| `clear` | `emby-dl queue clear` | Empty the entire persistent queue |
+
+*Lifecycle Example:*
+```bash
+# 1. Add series over time
+emby-dl queue add "Black Clover" S1
+emby-dl queue add "One Piece" S2 all
+emby-dl queue add "Attack on Titan" S4 --series-id 12345 --source max
+
+# 2. Inspect waiting items
+emby-dl queue list
+# === Persistent Queue (3 items) ===
+#   [1] Black Clover S1
+#   [2] One Piece S2 all
+#   [3] Attack on Titan [id=12345] S4
+
+# 3. Dry-run plan and preview required storage
+emby-dl queue plan
+
+# 4. Remove an unwanted item
+emby-dl queue remove 2
+
+# 5. Start downloading the queue
+emby-dl queue run --notify
+
+# 6. Clear queue manually if needed
+emby-dl queue clear
+```
+
+#### 3.6.4 Detailed Subcommand Help
+
+Every queue action provides its own dedicated, rich `--help` manual:
+
+```bash
+emby-dl queue --help          # Main queue overview & syntax guide
+emby-dl queue add --help      # Detailed guide & examples for adding series
+emby-dl queue list --help     # Guide for listing and JSON exports
+emby-dl queue run --help      # Guide for running and notification options
+emby-dl queue plan --help     # Guide for dry-run previewing
+emby-dl queue remove --help   # Guide for index-based removal
+emby-dl queue clear --help    # Guide for clearing the queue
+```
+
+---
+
+### 3.7 Multi-Level Automatic Failure Rescheduling
+
+To ensure maximum download completion without human babysitting, `emby-dl` implements
+a **Three-Level Failure Rescheduling Architecture**:
+
+1. **Level 1 — Micro-Retry with Backoff:**
+   When an episode encounters an error (transient network glitch, transcode startup delay, or socket timeout),
+   it is retried up to 3 times with exponential backoff (e.g. 5s, 10s) and an extended 60s API timeout.
+2. **Level 2 — Intra-Series Queue Rescheduling:**
+   If an episode still fails after Level 1 retries, it is **not abandoned**. It is automatically
+   moved to the **end of the current series queue** (`pending_queue.append(failed_item)`).
+   Downloading continues immediately with the subsequent episodes so the queue is never halted.
+   Once the other episodes complete, the failed episode is attempted again fresh. Because previously
+   downloaded HLS segments are preserved in `<dest>.hls`, the retry resumes instantly.
+3. **Level 3 — Queue-Level Sweep Pass:**
+   At the end of a multi-series queue, the queue engine audits `downloaded_dataset.json`. If any
+   series has missing episodes, it runs an automatic sweep pass. Because completed episodes are
+   already recorded, they are skipped in milliseconds and only missing episodes are retrieved.
+
+---
+
+### 3.8 HLS Streaming Mode & Lossless Remuxing Pipeline
+
+For servers running Emby 4.x that hang on HTTP `Range:` headers or throttle single direct streams,
+`emby-dl` provides an advanced **HLS Segment Engine**:
+
+- **Configuration:** Set `"download_mode": "hls"` in `config.json`.
+- **Parallel Segment Fetching:** Downloads small `.ts` segments concurrently using worker threads
+  (`hls_workers`, default 4) with per-segment auto-retry (`hls_segment_retries`).
+- **Lossless Remux Pipeline:** Segments are losslessly concatenated and remuxed into MKV or MP4.
+  To eliminate Matroska timestamp rejections (`Can't write packet with unknown timestamp`), the
+  engine remuxes via an MP4 intermediate (`TS -> MP4 intermediate -> MKV / MP4`), regenerating
+  presentation timestamps (`+genpts`) while preserving 100% original video/audio quality.
+- **Terminal Hang Protection:** ffmpeg is invoked with `-nostdin` to prevent 30-minute hangs on
+  closed terminal standard input.
+- **Embedded Subtitles:** Subtitle tracks are retrieved from Emby and muxed losslessly into the final MKV.
+
+---
+
+### 3.9 Telegram Two-Way Bot Integration & Real-Time Status
+
+When `telegram_bot_token` and `telegram_chat_id` are configured in `config.json`, `emby-dl`
+spawns an interactive daemon bot thread during downloads:
+
+- **Automatic Bot Provisioning & Switching Safeguards:**
+  - `deleteWebhook` Execution: Whenever the bot thread initializes, `deleteWebhook` is automatically
+    invoked to clear any dangling webhooks from previous integrations. This completely eliminates
+    silent `HTTP 409 Conflict` errors and ensures long-polling (`getUpdates`) always succeeds.
+  - Automatic Description & Commands Registration: On startup, `setMyCommands`, `setMyDescription`,
+    and `setMyShortDescription` configure the bot's commands and profile description on Telegram's servers.
+  - Dynamic Hot-Reloading: If you edit `config.json` and change `telegram_bot_token` or `telegram_chat_id`
+    while a multi-hour download is running, the running bot thread automatically detects the change
+    within 30 seconds, provisions the new bot, and migrates polling seamlessly without interrupting the transfer.
+- **Interactive Commands:**
+  - `/status`: Displays real-time download status for the currently downloading episode, speed, remaining size, and estimated time of arrival (`ETA`).
+  - `/queue`: Displays a comprehensive, detailed breakdown of the entire download queue, including overall queue progress, active series indicator (`⏳`), completed series (`✅`), waiting series (`🕒`), per-series episode counts (`x/y`), estimated sizes, and remaining queue total.
+  - `/help`: Lists available bot commands.
+  - `/ping`: Responds with `pong` to verify bot responsiveness.
+- **Live ETA Calculation:** Real-time remaining time is computed from instantaneous transfer speeds
+  and displayed in `/status` and in periodic 10-minute notifications.
+- **Accurate Queue Progress:** `Total Queue` strictly filters against the active queue's target
+  series IDs, ensuring historical downloads never distort queue progress counters.
+
+#### Sample Bot Outputs
+
+**`/status` — Live Transfer Status & ETA:**
+```text
+Status: running
+Completed: 4/16 (remaining: 12)
+Current: The Flower of Evil - زهرة الشر S01E05 (64.2%)
+Queue: [2/5] The Flower of Evil - زهرة الشر
+Total Queue: 10/74 episodes (13.5%)
+Downloaded: 163.50 MiB / 254.76 MiB
+Speed: 1.85 MiB/s
+ETA: 00:49
+```
+
+**`/queue` — Comprehensive Queue Breakdown:**
+```text
+📋 تفاصيل طابور التحميل (Queue Details)
+الحالة: قيد التشغيل 🟢
+المسلسل الحالي: [2/5] The Flower of Evil - زهرة الشر
+إجمالي تقدم الطابور: 10/74 حلقة (13.5%)
+
+قائمة المسلسلات في الطابور:
+1. ✅ الخليفة [S2 all] — (6/6 حلقات) (~3.83 GiB)
+2. ⏳ The Flower of Evil [all] — (4/16 حلقات) (~4.54 GiB)
+3. 🕒 حياة الاخرين [all] — (0/6 حلقات) (~5.08 GiB)
+4. 🕒 الطبيب المعجزة [S1 E21-64] — (0/44 حلقات) (~36.29 GiB)
+5. 🕒 اخواتي [all] — (0/15 حلقات) (~2.70 GiB)
+
+المتبقي في الطابور: 64 حلقة
+```
+
+#### Switching to a New Bot (Step-by-Step)
+```text
+1. Create a new bot in @BotFather on Telegram and copy the API token.
+2. Update "telegram_bot_token" in config.json.
+3. Open your new bot in Telegram and tap "Start" (or send /start).
+```
+The tool will automatically delete any legacy webhooks, register all 5 commands in Telegram's menu, and provision the bot's description and profile summary. You can verify the bot connection at any time by running `emby-dl doctor`.
+
+### 3.10 What happens during a download
 
 For every item:
 
@@ -338,16 +614,16 @@ For every item:
 3. **If the final file exists and is byte-exact** → skip (or self-heal the dataset).
 4. **If a `.part` file exists** → one short Range probe. No progress or a bad
    response → delete it and download fresh.
-5. **Download** with `curl -f -L --speed-limit … --speed-time …` into `.part`.
+5. **Download** with `curl -f -L --speed-limit … --speed-time …` into `.part` (or HLS segment fetcher).
 6. **Validate** HTTP status (200/206), content type (reject `text/`, JSON, XML,
    HTML), curl exit code, and exact byte count.
 7. **Rename** `.part` → final name atomically and write the dataset entry.
 
 Any HTTP 401/403 exits `3` (auth). HTTP 5xx and connection failures retry with
 health-gated backoff (15 → 30 → 60 → 120 … max 600 s). Other failures retry up to
-`max_retries`; the batch keeps going and exits `1` if anything failed.
+`max_retries`; if an item still fails, it is rescheduled to the end of the series queue.
 
-### 3.6 Progress modes
+### 3.11 Progress modes
 
 `--progress=auto|plain|json|none` (download/watch; `verify --fix` also accepts it):
 
@@ -369,7 +645,7 @@ tools/emby_dl status
 tools/emby_dl status --json
 ```
 
-### 3.7 `verify` — audit what is on disk
+### 3.12 `verify` — audit what is on disk
 
 ```bash
 tools/emby_dl verify                       # every recorded file
@@ -390,7 +666,7 @@ and the dataset byte count matches the file. Issues:
 `--fix` re-downloads `missing_file` and `size_mismatch` items and updates stale
 dataset sizes. Exit `0` when no issues remain, `1` otherwise.
 
-### 3.8 `watch` — poll for new episodes
+### 3.13 `watch` — poll for new episodes
 
 ```bash
 tools/emby_dl watch "في السابعة عشر" --interval 600 --notify
@@ -406,13 +682,13 @@ tools/emby_dl watch "في السابعة عشر" --once --json
 - `Ctrl-C` stops cleanly.
 - Notifications are sent only when a batch actually downloads or fails.
 
-### 3.9 Lock and disk behavior
+### 3.14 Lock and disk behavior
 
 - Lock file: `downloads/.emby_dl.lock` (flock). A second concurrent download
   exits **5**. The lock is held only while a batch is downloading.
 - Disk preflight runs before a batch using the sum of known todo sizes, and again
   before each file. Insufficient space exits **6**; nothing is recorded.
-- Only one curl connection exists at any moment.
+- Only one curl connection exists at any moment in direct mode.
 
 ---
 
@@ -425,7 +701,10 @@ tools/emby_dl watch "في السابعة عشر" --once --json
 | `<downloads>/downloaded_dataset.json` | central index, schema v3 (authoritative commit point) |
 | `<downloads>/<Series>/downloaded_dataset.json` | per-series derived copy |
 | `<downloads>/.emby_dl.lock` | machine-wide download lock |
-| `<downloads>/.emby_dl_state.json` | live progress state for `status` |
+| `<downloads>/.emby_dl_state.json` | live progress state for single downloads & `status` |
+| `<downloads>/.queue_state.json` | live queue progress state for multi-series runs & bot |
+| `<downloads>/.download_queue.json` | persistent queue storage for `queue add/list/run` |
+| `<downloads>/.emby_series_cache.json` | persistent series resolution cache (0.02s zero-search lookups) |
 | `<downloads>/.emby_dl_caps.json` | cached server capabilities probe |
 | `<downloads>/.emby_dl_headers` | mode `0600` private header file for curl (`-K`) |
 
@@ -454,7 +733,7 @@ Schema v3 keys by `series_id` and records exact byte size, season/episode IDs, s
       "size_mb": 559,
       "container": "mkv",
       "attempts": 1,
-      "tool_version": "1.2.0",
+      "tool_version": "1.3.0",
       "duration_minutes": 0.42,
       "downloaded_at": "2026-11-06 10:13"
     }
@@ -517,6 +796,8 @@ Output checks:
 7. `dataset`: runs `dataset --check`.
 8. `dataset_schema`: matches v3.
 9. `server_reachable` & `token_valid`: live server health check.
+10. `telegram_bot`: verifies `telegram_bot_token` validity via Telegram `getMe` API and checks bot username.
+11. `telegram_chat`: verifies `telegram_chat_id` configuration.
 
 Exits `0` if all checks pass, `1` if any check fails.
 
@@ -617,6 +898,10 @@ own "not found" messages are explicit.
 | `Episode N not found` | wrong season index/series → `list --series-id ...` |
 | `Season N not found` | the series has different season indexes → `list` |
 | `verify` reports `dataset_size_stale` | file is fine; rerun `verify --fix` or `dataset --rebuild` |
+| `hls_error: timed out` | server transcode spin-up delay → automatically retried with 60s timeout, or supply `--series-id` to bypass database search |
+| `hls_error: duration mismatch` | Emby boundary frame padding → automatically handled by `max(90.0, expected * 0.03)` tolerance |
+| `Can't write packet with unknown timestamp` | Emby HLS video packets lack timestamps → automatically repaired by lossless MP4 intermediate (`TS -> MP4 -> MKV/MP4`) |
+| `/queue command says Unknown command` | running bot process loaded older code in memory → restart the session to reload bytecode; `/setMyCommands` registers it automatically |
 
 ---
 

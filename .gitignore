@@ -15,13 +15,23 @@ venv/
 env/
 
 # Emby DL runtime credentials and downloaded media
+.env
+.env.*
 .emby_config
+config.json
 downloads/
 *.part
 .emby_dl_headers
 .emby_dl_caps.json
 .emby_dl_state.json
 .emby_dl.lock
+.queue_state.json
+.download_queue.json
+.emby_series_cache.json
+tools/new_series_queue.txt
+
+# External integrations
+integrations/
 
 # Test artifacts and caches
 .pytest_cache/
