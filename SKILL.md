@@ -1,11 +1,14 @@
 ---
 name: emby-dl
-description: Comprehensive operational guide and complete institutional knowledge base for installing, maintaining, and executing emby-dl, the resilient Emby CLI downloader and dataset manager.
+description: Comprehensive operational guide and complete institutional knowledge base for installing, maintaining, and executing emby-dl, the resilient Emby CLI downloader and dataset manager. Built for autonomous AI coding agents and terminal power users.
 triggers:
   - emby
   - emby-dl
   - emby_dl
   - download series
+  - queue
+  - طابور
+  - تحميل مسلسل
   - emby media
   - emby server
   - الملك2
@@ -13,16 +16,17 @@ triggers:
 
 # `emby-dl` Skill — Autonomous Agent Operational Manual & Knowledge Base
 
-This skill is a self-contained, definitive operational manual and institutional knowledge base for any AI coding assistant (OpenCode, Claude Code, Cursor, Windsurf, Roo, etc.). It enables any agent to install, verify, execute, and maintain `emby-dl` to interact reliably with Emby media servers (specifically the home server **الملك2** at `http://10.10.10.9:8096` and standard Emby 4.x servers).
+This skill is a self-contained, definitive operational manual and institutional knowledge base for any AI coding assistant (OpenCode, Claude Code, Cursor, Windsurf, Roo, etc.). It enables any agent to install, verify, execute, automate, and maintain `emby-dl` to interact reliably with Emby media servers (specifically the home server **الملك2** at `http://10.10.10.9:8096` and standard Emby 4.x servers).
 
 ---
 
 ## 1. Tool Identity & GitHub Repository
 
 - **Project Name:** `emby-dl` (CLI commands: `emby-dl` and `emby_dl`)
+- **Current Version:** `1.3.0` (2026-11-13)
 - **Official GitHub Repository:** **[https://github.com/MohammedGalal-IT/emby-dl](https://github.com/MohammedGalal-IT/emby-dl)**
 - **License:** MIT
-- **Architecture:** Pure Python 3.10+ standard library + `curl` (zero third-party dependencies required).
+- **Architecture:** Pure Python 3.10+ standard library + `curl` + `ffmpeg` (zero third-party Python dependencies required).
 - **Supported Platforms:** Linux, Windows 10/11, macOS.
 
 ---
@@ -77,7 +81,7 @@ Always run the built-in diagnostic doctor before starting automated download tas
 ```bash
 emby-dl doctor --json
 ```
-If `ok: true`, all 9 pre-flight systems are healthy:
+If `ok: true`, all pre-flight diagnostic systems are healthy:
 1. `curl`: Executable found in `$PATH`.
 2. `server_url`: Server endpoint configured.
 3. `access_token`: Authentication token present.
@@ -87,7 +91,8 @@ If `ok: true`, all 9 pre-flight systems are healthy:
 7. `disk_space`: Free disk exceeds required reserve (default 2 GiB).
 8. `dataset`: Consistency check passes (`dataset --check`).
 9. `dataset_schema`: Schema version is current (Schema v3).
-10. `server_reachable` & `token_valid`: Real-time ping to Emby server.
+10. `server_reachable` & `token_valid`: Real-time ping and authentication to Emby server.
+11. `telegram_bot` & `telegram_chat`: Token authentication via Telegram `getMe` and chat ID verification (if configured).
 
 ---
 
@@ -100,7 +105,7 @@ When running on the local home network, **`emby-dl` requires zero configuration*
 - **Default User ID:** `f5d170effc9b40d4a6183b9288c1d055`
 - **Default Downloads Directory:**
   - Linux / macOS: `~/Downloads/Emby`
-  - Windows: `%USERPROFILE%\Downloads\Emby`
+  - Windows: `%USERPROFILE%\Downloads\Emby` (or project root `config.json` `downloads_path`)
 
 **Automatic Passwordless First-Run Login:**
 The default lounge user (`دخول الاستراحة 2`) has no password. If `access_token` is missing from the local config, the tool automatically contacts `http://10.10.10.9:8096`, obtains a fresh access token, saves it locally, and executes the command seamlessly.
@@ -147,9 +152,11 @@ Environment variables take precedence over configuration files (`CLI flags > ENV
      - `verdict`: Per-file result (`downloaded`, `skipped`, `self_healed`, `failed`) and reason.
      - `summary`: Overall batch summary.
 
-4. **ALWAYS Disambiguate with `--series-id` When Ambiguous:**
+4. **ALWAYS Disambiguate with `--series-id` When Ambiguous (Universal Support):**
    - If an Emby server has multiple series with the same name, `emby-dl` strictly refuses to guess and exits with **code 4**, listing candidates with their IDs and release years.
    - Always supply `--series-id <id>` (e.g. `emby-dl plan "Black Clover" --series-id 276491 S2`).
+   - `--series-id` is supported universally across all input modes: single downloads, planning, queue text files (`Show S1 --series-id 1234`), `queue add`, `watch`, and `verify`.
+   - **Smart Series Resolution Cache:** The tool automatically caches resolved series IDs locally in `.emby_series_cache.json` and seeds from `downloaded_dataset.json`. Subsequent commands resolve in **0.02 seconds** directly via `/Items/{id}`, completely eliminating server-side full-library search timeouts.
 
 5. **NEVER Issue Manual `curl` or `Range:` Requests Directly:**
    - Emby servers (specifically 4.9.x on Windows) hang indefinitely on HTTP `Range: bytes=...` headers. `emby-dl` contains specialized probe-and-restart logic designed specifically for this bug. Let the tool manage curl.
@@ -157,6 +164,11 @@ Environment variables take precedence over configuration files (`CLI flags > ENV
 6. **Token Secrecy via `curl -K`:**
    - The tool passes authentication headers to curl via a private temporary configuration file (`.emby_dl_headers`, mode `0600`) with `-K`.
    - The token never appears in process arguments, `/proc/<pid>/cmdline`, or shell histories.
+
+7. **Multi-Level Automatic Failure Rescheduling (Autonomous Resilience):**
+   - Do NOT abort a batch if an individual episode encounters an error. `emby-dl` automatically reschedules failed episodes to the end of the series queue (`pending_queue.append(failed_item)`).
+   - The downloader proceeds with remaining episodes and re-attempts failed ones at the end of the series.
+   - At the queue level, `emby-dl queue` automatically runs an auto-retry sweep pass over incomplete series.
 
 ---
 
@@ -169,10 +181,23 @@ emby-dl init [--server-url URL] [--username USER] [--password PWD]
 
 # Dry run / pre-flight plan
 emby-dl plan "Series Name" [spec] [--series-id ID] [--source 1|N|max] [--json]
+emby-dl plan -f queue.txt [--json]
 
 # Download episodes (subcommand optional: bare series name defaults to download)
 emby-dl download "Series Name" [spec] [--series-id ID] [--source 1|N|max] [--json]
+emby-dl download -f queue.txt [--notify] [--json]
 emby-dl "Series Name" [spec] [--series-id ID] [--source 1|N|max] [--json]
+
+# Multi-series queue execution and management
+emby-dl queue "Show A" "Show B" "Show C" [--json]
+emby-dl queue "Show A" S1 ; "Show B" all [--json]
+emby-dl queue -f queue.txt [--notify] [--json]
+emby-dl queue add "Show A" S1 [--series-id ID] [--source 1|N|max]
+emby-dl queue list [--json]
+emby-dl queue run [--notify] [--progress auto|plain|json|none]
+emby-dl queue plan [-f queue.txt] [--json]
+emby-dl queue remove <index>
+emby-dl queue clear
 
 # Live status of active background download
 emby-dl status [--json]
@@ -231,7 +256,76 @@ When episodes have multiple formats or qualities:
 
 ---
 
-## 7. Exit Codes & Error Recovery Playbook
+## 7. Multi-Series Queue Automation (`queue`)
+
+AI agents should use the `queue` command when tasks require downloading multiple series:
+
+```bash
+# 1. Direct multi-series execution with per-series specs
+emby-dl queue "Show A" S1 ; "Show B" all ; "Show C" S2 E1-5 --json
+
+# 2. File-based queue execution (supports inline --series-id on any line)
+emby-dl queue -f queue.txt --json
+
+# 3. Persistent queue automation
+emby-dl queue add "Show A" S1 --series-id 1234
+emby-dl queue add "Show B" all --source max
+emby-dl queue list --json
+emby-dl queue run --json
+
+# 4. Queue dry-run planning & total disk calculation
+emby-dl queue plan -f queue.txt --json
+```
+
+**Queue File Syntax (`queue.txt`):**
+```text
+# Comments and blank lines are ignored
+فنون سارا The Art of Sarah
+The Flower of Evil - زهرة الشر S1 E1-10
+انت من احب S1 E21-23 --source max
+المدينة البعيدة S2 E27-35 --series-id 145070
+المدينة البعيدة S3 all --series-id 145070
+```
+
+**Queue Rescheduling Architecture:**
+- If an individual episode fails, `emby-dl` automatically reschedules it to the end of the series queue (`pending_queue.append(failed_item)`).
+- The agent's overall queue never halts due to a single transient glitch.
+- On multi-series runs, `Total Queue` and live `ETA` are streamed in real time.
+- All resolved series IDs are cached in `.emby_series_cache.json` for instant 0.02s zero-search future lookups.
+
+---
+
+## 8. HLS Streaming Mode & Lossless Remux Architecture
+
+For servers running Emby 4.x that hang on HTTP `Range:` headers or throttle single direct streams, configure `"download_mode": "hls"` in `config.json`.
+
+### Two-Stage Lossless Remux Pipeline:
+Emby's live HLS transcoder emits MPEG-TS segments where video packets frequently lack timestamps. Direct Matroska muxing fails with `Can't write packet with unknown timestamp`. `emby-dl` solves this natively:
+1. **Raw Segment Concatenation:** Concatenates downloaded `.ts` segments into a single transport stream (preserves exact duration; does not drift like concat demuxer).
+2. **Stage 1 (MP4 Intermediate):** Invokes `ffmpeg -nostdin -hide_banner -loglevel error -y -fflags +genpts -i input.ts -map 0:v:0 -map 0:a:0? -c copy -f mp4 temp.mp4`. MP4 muxer repairs and normalizes presentation timestamps with zero re-encoding.
+3. **Stage 2 (Final Container):** Remuxes `temp.mp4` to final MKV or MP4, losslessly muxing SubRip subtitles into MKV.
+4. **Stdin Hang Protection:** All ffmpeg/ffprobe subprocesses enforce `-nostdin` to eliminate 30-minute hangs in background agent shells.
+5. **Duration Tolerance:** Enforces `tolerance = max(90.0, expected_duration * 0.03)` to tolerate transcode keyframe padding while catching truncated files.
+
+---
+
+## 9. Interactive Telegram Bot Integration
+
+When `notifications.telegram_bot_token` and `telegram_chat_id` are configured in `config.json`, `emby-dl` spawns an interactive daemon bot thread:
+- **Automatic Provisioning & Bot Switching Safeguards:**
+  - `deleteWebhook` Execution: Automatically purges dangling webhooks on startup to prevent silent `HTTP 409 Conflict` errors when switching bot tokens.
+  - Automatic Description & Commands: Sets `setMyCommands`, `setMyDescription`, and `setMyShortDescription` automatically on Telegram servers.
+  - Dynamic Hot-Reloading: Inspects `config.json` every 30 seconds; changing tokens during active downloads migrates polling to the new bot in-memory without restarting.
+- **Interactive Commands:**
+  - `/status`: Displays real-time download status, active episode, transfer speed, and instantaneous `ETA`.
+  - `/queue` (or `/q`): Detailed queue breakdown showing active series (`⏳`), completed series (`✅`), waiting series (`🕒`), per-series counts, estimated sizes, and remaining queue total.
+  - `/help`: Lists available bot commands.
+  - `/ping`: Pong response.
+- **Accurate Queue Progress:** `Total Queue` strictly filters against `target_series_ids`, ensuring previous downloads from past jobs never skew queue progress counters.
+
+---
+
+## 10. Exit Codes & Error Recovery Playbook
 
 | Exit Code | Category | Meaning | Autonomous Agent Recovery Action |
 |:---:|---|---|---|
@@ -245,13 +339,13 @@ When episodes have multiple formats or qualities:
 
 ---
 
-## 8. Institutional Memory — Emby Server Quirks
+## 11. Institutional Memory — Emby Server Quirks
 
 These facts are verified against Emby Server 4.9.x on Windows (host: **الملك2** `http://10.10.10.9:8096`):
 
 1. **Broken Range Requests (HTTP 206 / Resume Hang):**
    - The server advertises `Accept-Ranges: bytes`, but requests containing `Range: bytes=...` stall indefinitely with zero bytes sent.
-   - **Workaround:** `emby-dl` performs one short resume probe (10s timeout). If the probe stalls, it purges `.part` and downloads fresh. Never try manual Range resume.
+   - **Workaround:** `emby-dl` performs one short resume probe (10s timeout). If the probe stalls, it purges `.part` and downloads fresh. In HLS mode, Range requests are avoided entirely.
 
 2. **HTTP 500 Error Bodies on Broken Streams:**
    - When a video stream fails internally on the server, Emby responds with HTTP 500 and a short plain text body (`text/plain`).
@@ -268,11 +362,9 @@ These facts are verified against Emby Server 4.9.x on Windows (host: **المل�
    - Emby 4.9.x returns `HTTP 500 Unrecognized Guid format` for `/Users/Me`.
    - Always query `/Users/{user_id}` with the concrete user ID.
 
-5. **Known Series IDs on "الملك2":**
-   - **في السابعة عشر:** Series ID `267519` (Season 1 ID `267520`)
-   - **المنظمة:** Series ID `145073`
-   - **اسطنبول راساً على عقب:** Series ID `267954`
-   - **Black Clover:** Primary Series ID `276491` (Duplicate ID: `114002` — always use `--series-id 276491`)
+5. **Title Search Latency Under Transcode Load:**
+   - Full-text search (`GET /Items?SearchTerm=...`) on large libraries can take >20s when transcoding is active, causing timeouts.
+   - Always supply `--series-id <id>` or allow `SeriesCache` to resolve via cached IDs in 0.02s.
 
 6. **Dataset Schema v3 Architecture:**
    - `<downloads>/downloaded_dataset.json` is the single authoritative commit point.
@@ -285,3 +377,7 @@ These facts are verified against Emby Server 4.9.x on Windows (host: **المل�
      ```bash
      emby-dl dataset --check
      ```
+
+---
+
+*Last updated: Fri 2026-11-13 | Tool version: emby_dl 1.3.0*

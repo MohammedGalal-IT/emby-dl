@@ -484,7 +484,7 @@ class EmbyToolTest(unittest.TestCase):
         self.assertEqual(entry["series_id"], "s1")
         self.assertEqual(entry["relative_path"],
                          "Alpha Show/Season 1/Alpha Show - S01E01.mkv")
-        self.assertEqual(entry["tool_version"], "1.2.0")
+        self.assertEqual(entry["tool_version"], "1.3.0")
         self.assertGreaterEqual(int(entry["attempts"]), 1)
         series_dataset = json.loads(
             (self.downloads / "Alpha Show" / "downloaded_dataset.json")
@@ -969,7 +969,7 @@ class EmbyToolTest(unittest.TestCase):
         self.assertTrue(cache.exists())
         data = json.loads(cache.read_text(encoding="utf-8"))
         self.assertEqual(data["server_name"], "FakeKing")
-        self.assertEqual(data["tool_version"], "1.2.0")
+        self.assertEqual(data["tool_version"], "1.3.0")
         original = data["updated_at"]
 
         # --reset-caps clears the cache; the same command re-probes and
@@ -1050,6 +1050,74 @@ class EmbyToolTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0)
         self.assertIn("Welcome to emby_dl", res.stdout)
         self.assertIn("init", res.stdout)
+
+    def test_queue_add_list_remove_clear(self):
+        res = self.run_tool("queue", "add", "Alpha Show", "S1")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("Added to queue", res.stdout)
+
+        res = self.run_tool("queue", "add", "Beta Show", "all")
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        list_res = self.run_tool("queue", "list", "--json")
+        self.assertEqual(list_res.returncode, 0, list_res.stderr)
+        items = json.loads(list_res.stdout)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["series"], "Alpha Show")
+        self.assertEqual(items[0]["spec"], ["S1"])
+        self.assertEqual(items[1]["series"], "Beta Show")
+
+        rem_res = self.run_tool("queue", "remove", "1")
+        self.assertEqual(rem_res.returncode, 0, rem_res.stderr)
+        self.assertIn("Removed [1]", rem_res.stdout)
+
+        clear_res = self.run_tool("queue", "clear")
+        self.assertEqual(clear_res.returncode, 0, clear_res.stderr)
+        empty_list = self.run_tool("queue", "list", "--json")
+        self.assertEqual(json.loads(empty_list.stdout), [])
+
+    def test_queue_plan_args_and_file(self):
+        self.state["series"].append(
+            {"Id": "s2", "Name": "Beta Show", "Type": "Series", "ProductionYear": 2021})
+        self.state["seasons"]["s2"] = [
+            {"Id": "se9", "IndexNumber": 1, "Name": "Season 1"}]
+        self.state["episodes"]["se9"] = [
+            make_episode("e91", 1, "Beta Pilot", 20_000)]
+        self.state["payloads"]["e91"] = pattern_bytes(20_000, 9)
+
+        # 1. Multiple args
+        res = self.run_tool("queue", "plan", "Alpha Show", "S1", ";", "Beta Show", "all")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("Alpha Show", res.stdout)
+        self.assertIn("Beta Show", res.stdout)
+        self.assertIn("Grand Total:", res.stdout)
+
+        # 2. From file
+        q_file = self.tempdir / "queue_test.txt"
+        q_file.write_text("Alpha Show S1\nBeta Show all\n", encoding="utf-8")
+        res2 = self.run_tool("plan", "-f", str(q_file))
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+        self.assertIn("Alpha Show", res2.stdout)
+        self.assertIn("Beta Show", res2.stdout)
+
+    def test_queue_download_file(self):
+        self.state["series"].append(
+            {"Id": "s2", "Name": "Beta Show", "Type": "Series", "ProductionYear": 2021})
+        self.state["seasons"]["s2"] = [
+            {"Id": "se9", "IndexNumber": 1, "Name": "Season 1"}]
+        self.state["episodes"]["se9"] = [
+            make_episode("e91", 1, "Beta Pilot", 20_000)]
+        self.state["payloads"]["e91"] = pattern_bytes(20_000, 9)
+
+        q_file = self.tempdir / "queue_dl.txt"
+        q_file.write_text("Alpha Show S1 E1\nBeta Show S1 E1\n", encoding="utf-8")
+        res = self.run_tool("download", "-f", str(q_file))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(self.dest(1, 1, "mkv").exists())
+        beta_dest = self.downloads / "Beta Show" / "Season 1" / "Beta Show - S01E01.mkv"
+        self.assertTrue(beta_dest.exists())
+        central = self.central()
+        self.assertEqual(central["total_episodes"], 2)
 
 
 if __name__ == "__main__":
