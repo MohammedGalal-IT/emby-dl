@@ -11,14 +11,14 @@ Read this together with [`tools/README.md`](../tools/README.md) (the concise too
 reference) and [`SKILL.md`](../SKILL.md) (the autonomous agent operational skill).
 This document is the "why" behind every "what".
 
-> **Current tool version:** `emby_dl 1.3.0` (2026-11-13). Adds official multi-series
+> **Current tool version:** `emby_dl 1.3.0` (2026-11-13; the v1.3.1 change set ships under this version string). Adds official multi-series
 > queue management (`emby-dl queue`), persistent queue storage, text-file batch queues (`-f`),
 > Smart Series Resolution Cache (`SeriesCache` with 0.02s lookups), multi-level failure
-> rescheduling (micro-retries, intra-series queue re-ordering, queue sweep pass),
+> rescheduling (per-file retries, intra-series queue re-ordering, queue sweep pass),
 > resilient HLS streaming mode with two-stage lossless MP4 remuxing (timestamp defect repair),
 > `-nostdin` terminal hang protection, interactive Telegram bot (`/status`, `/queue`, `/help`, `/ping`),
 > real-time ETA calculation, and dataset v3 integration. Over 269 episodes and 147+ GiB
-> downloaded and verified byte-exact.
+> downloaded and verified end-to-end.
 
 ---
 
@@ -119,7 +119,7 @@ Known series IDs verified and downloaded in this project:
 
 ### 3.2 HLS Segment Engine Mechanics [VERIFIED 2026-11-08]
 
-Because direct downloads cannot be resumed when the server or connection drops, `emby-dl` implements an **HLS Segment Engine** (`"download_mode": "hls"`). **HLS is the tool default** as of v1.3.0; the single-stream fallback is `"download_mode": "direct"`. Switching between them never re-downloads completed episodes (dataset entries are authoritative).
+Because direct downloads cannot be resumed when the server or connection drops, `emby-dl` implements an **HLS Segment Engine** (`"download_mode": "hls"`). **HLS is the tool default** as of the v1.3.1 change set; the single-stream fallback is `"download_mode": "direct"`. Switching between them never re-downloads completed episodes (dataset entries are authoritative).
 
 1. **Session Negotiation:**
    Calls `POST /Items/{item_id}/PlaybackInfo` with `{UserId, StartTimeTicks: 0, IsPlayback: True}`.
@@ -129,7 +129,7 @@ Because direct downloads cannot be resumed when the server or connection drops, 
    Parses `#EXTINF:<dur>` tags and segment paths (`hls1/main/0.ts?PlaySessionId=...`).
 3. **Resilient Parallel Segment Fetching:**
    Segments are saved to a directory `<destination>.hls/{index:05d}.ts`.
-   A `ThreadPoolExecutor` (4 worker threads) downloads segments concurrently using curl.
+   A `ThreadPoolExecutor` (4 worker threads by default; `hls_workers`, 1–8) downloads segments concurrently using curl.
    If any segment returns HTTP 404/410, it indicates playback session expiry. The engine transparently calls `_hls_session()` to refresh `PlaySessionId` and resumes only missing segments.
 4. **Resumable Across Process Restarts:**
    If the network disconnects, PC sleeps, or process is killed, all downloaded `.ts` segments remain intact in `.hls`. Upon restarting, existing segments are checked via `os.path.getsize(path) > 0` and skipped instantly. Only missing segments are fetched.
@@ -161,6 +161,7 @@ MPEG-4 container muxers (`-f mp4`) tolerate and reconstruct missing presentation
    final.mkv (or final.mp4)
 ```
 - **Stream Mapping:** Uses `-map 0:v:0 -map 0:a:0?` explicitly. Emby HLS MPEG-TS files expose duplicate program streams; bare `-map 0` erroneously mapped 4 streams (2 video + 2 audio) and caused muxer failures.
+- **Fallback:** if the MP4 intermediate fails (for example, a source that already carries valid timestamps), the tool remuxes directly from `concat.ts` instead of aborting the episode.
 - **Audio Sync & Duration Verification:** Raw byte concatenation preserves the true timeline (e.g. 7873.6s vs 7872.0s expected). The ffmpeg concat demuxer (`-f concat -i list.txt`) was tested and rejected because it accumulated audio tails across 1300+ segments, causing a +94s drift!
 
 ### 3.4 Terminal Stdin Hang Protection (`-nostdin`) [VERIFIED 2026-11-09]
@@ -219,8 +220,8 @@ To achieve unattended 100% completion across multi-day, multi-series jobs (e.g.,
                      NO                YES
                      │                  │
                      ▼                  ▼
-             [Record in Dataset]   [Level 1: Micro-Retry (3x)]
-                                   (60s timeout, exponential backoff)
+             [Record in Dataset]   [Level 1: Per-file retries]
+                                   (max_retries=5, health-gated backoff 15s -> 600s)
                                         │
                                         ▼ (Still failing?)
                                    [Level 2: Intra-Series Rescheduling]
@@ -236,7 +237,7 @@ To achieve unattended 100% completion across multi-day, multi-series jobs (e.g.,
 ```
 
 **Live Verification:**
-During the download of *اخواتي*, episodes 12 and 13 encountered a transient Windows socket error (`WinError 10065 unreachable host`). Rather than halting, Level 2 rescheduled E12 and E13 to the end of the queue. Episodes 14 and 15 completed, then E12 and E13 were re-attempted and completed byte-exact without human intervention.
+During the download of *اخواتي*, episodes 12 and 13 encountered a transient Windows socket error (`WinError 10065 unreachable host`). Rather than halting, Level 2 rescheduled E12 and E13 to the end of the queue. Episodes 14 and 15 completed, then E12 and E13 were re-attempted and completed successfully without human intervention.
 
 ### 5.2 Smart Series Resolution Cache (`SeriesCache`) [VERIFIED 2026-11-10]
 
@@ -305,10 +306,19 @@ When `notifications.telegram_bot_token` and `telegram_chat_id` are configured:
 13. **HLS transcode startup requires extended timeouts** — use `api_timeout_seconds: 60` and `api_retries: 3`.
 14. **Process memory does not update on file edit** — a running Python process keeps old bytecode in RAM until restarted.
 15. **Filter queue progress by target series IDs** — simple `len(dataset)` counts past history rather than active queue progress.
+16. **`verify` compares against the source size, not the HLS remux size** — HLS output legitimately differs, so `verify` can report false `size_mismatch` results. Use `dataset --check` as the authoritative HLS check; `verify --fix` accepts the recorded size and does not re-download.
 
 ---
 
 ## 10. Change log
+
+### v1.3.1 — 2026-11-13 (Home-Server Profile & HLS Default)
+
+- **HLS became the default `download_mode`**; `direct` remains available and completed episodes are never re-fetched when switching.
+- **ffmpeg auto-detection:** `ffmpeg_path` → `PATH` → known Windows locations, with a fail-fast error before any bytes are transferred when it is missing.
+- **Home-server defaults baked into `DEFAULT_CONFIG`:** server URL, username, 60 s API timeout, 2 GiB disk reserve.
+- **Tracked `config.json`** carrying the home-server profile; ensure it is mode `600` on POSIX.
+- Note: `VERSION` and `pyproject.toml` still report `1.3.0`; there is no git tag or GitHub release for v1.3.1.
 
 ### v1.3.0 — 2026-11-13 (Multi-Series Queue, HLS Remux Engine & Bot Polish)
 
@@ -319,7 +329,7 @@ When `notifications.telegram_bot_token` and `telegram_chat_id` are configured:
 - **Smart Series Resolution Cache (`SeriesCache`)**: Persistent cache (`.emby_series_cache.json`) auto-seeded from dataset; enables 0.02s lookups and eliminates search timeouts. Universal `--series-id` support added across all commands and queue files.
 - **Interactive Telegram Bot Upgrades**: Added dedicated `/queue` command, live remaining time (`ETA`) in status and periodic alerts, and strict queue filtering using `target_series_ids`.
 - **Resilience Defaults**: Default `api_timeout_seconds` increased to 60s, `api_retries` increased to 3 with exponential backoff.
-- **Massive Production Verification**: 269 episodes (147.26 GiB) across 23 distinct series downloaded and verified byte-exact.
+- **Massive Production Verification**: 269 episodes (147.26 GiB) across 23 distinct series downloaded and verified.
 
 ### v1.2.0 — 2026-11-07 (Phase C polish)
 - Dataset Schema v3 with central atomic commit point.
@@ -333,4 +343,4 @@ When `notifications.telegram_bot_token` and `telegram_chat_id` are configured:
 
 ---
 
-*Last verified: Fri 2026-11-13 (server 4.9.3.0, tool 1.3.0). Verified across 269 episodes and 147+ GiB.*
+*Last verified: Fri 2026-11-13 (server 4.9.3.0, tool 1.3.0 / v1.3.1 feature set). Verified across 269 episodes and 147+ GiB.*

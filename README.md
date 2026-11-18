@@ -4,7 +4,7 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**`emby-dl`** is a resilient, single-stream command-line downloader and dataset manager for [Emby media servers](https://emby.media). Built for both humans in the terminal and autonomous AI coding agents, it prioritizes reliability, byte-exact verification, and zero unverified downloads.
+**`emby-dl`** is a resilient, single-episode command-line downloader and dataset manager for [Emby media servers](https://emby.media). Built for both humans in the terminal and autonomous AI coding agents, it prioritizes reliability, verified transfers, and zero unverified recordings.
 
 ---
 
@@ -20,8 +20,8 @@
 
 - **Zero-Config Default:** Pre-configured with the default home server URL (`http://10.10.10.9:8096`) and auto-authentication for `دخول الاستراحة 2` — works immediately after installation on the local network!
 - **Cross-Platform:** Works on Linux, Windows 10/11, and macOS out of the box with zero third-party dependencies (standard library + `curl`).
-- **Machine-Wide Single Stream:** Exclusive file locking guarantees transfers never saturate your server or local disk with parallel jobs.
-- **Exact-Size Verification:** Every downloaded episode is matched byte-for-byte against the server's reported file size before being confirmed.
+- **Machine-Wide Single Episode:** Exclusive file locking guarantees only one episode downloads at a time; HLS may fetch several segments of that episode concurrently, but never two episodes.
+- **Verified Downloads:** Direct mode matches the server's exact byte count; HLS mode verifies duration and records the exact remuxed size (source and container differ by design).
 - **Atomic Operations:** Downloads to `.part` files and renames only after verification — never leaving corrupt half-files.
 - **Range-Hang Resilient:** Emby 4.x servers often hang indefinitely on HTTP `Range:` headers. `emby-dl` uses smart probe-and-restart logic rather than hanging.
 - **Smart Series Resolution Cache:** Automatically caches series IDs locally from previous lookups and downloads, enabling instant 0.02-second lookups that bypass slow full-library searches and eliminate server search timeouts.
@@ -83,7 +83,9 @@ cp completions/emby_dl.fish ~/.config/fish/completions/
 
 ### 1. Ready Out of the Box (Zero-Config)
 
-If you are on the home network, **`emby-dl` works right away** without any setup. It connects to `http://10.10.10.9:8096` using `دخول الاستراحة 2` and downloads to `~/Downloads/Emby` (or `%USERPROFILE%\Downloads\Emby` on Windows). All default download settings (HLS mode, stall thresholds, retries, timeouts) are pre-tuned to match the home-server profile — installing on another machine behaves identically out of the box:
+If you are on the home network, **`emby-dl` works right away** without any setup. It connects to `http://10.10.10.9:8096` using `دخول الاستراحة 2` and downloads to `./downloads` (resolved against the config file's directory, or the current directory when no config exists). All default download settings (HLS mode, stall thresholds, retries, timeouts) are pre-tuned to match the home-server profile — installing on another machine behaves identically out of the box:
+
+> **Using a git checkout on Linux/macOS:** the tracked `config.json` is tuned for the Windows workstation and sets `downloads_path` to `D:\film`. Override it with `--downloads-dir ~/Downloads/Emby` or edit `downloads_path` before downloading.
 
 ```bash
 # Verify connection to the home server
@@ -140,9 +142,7 @@ emby-dl init --server-url "http://10.10.10.9:8096" --username "myuser" --passwor
 - **Default Config Location:**
   - Linux/macOS: `~/.config/emby_dl/config.json`
   - Windows: `%APPDATA%\emby_dl\config.json`
-- **Default Downloads Folder:**
-  - Linux/macOS: `~/Downloads/Emby`
-  - Windows: `%USERPROFILE%\Downloads\Emby`
+- **Default Downloads Folder:** `./downloads`, resolved against the directory containing `config.json` (or the current directory when no config exists). `init` inherits this default; pass `--downloads-dir <path>` to choose another location.
 
 ### 3. Verify System Health (`doctor`)
 
@@ -180,8 +180,9 @@ Download, plan, and automate multiple series in a single command, from a queue f
 ```bash
 # 1. Direct Multi-Series Execution (one command)
 emby-dl queue "Black Clover" "One Piece" "Bleach"
-emby-dl queue "Black Clover" S1 E1-10 ; "One Piece" S2 all ; "Bleach" S1
+emby-dl queue "Black Clover" S1 E1-10 ';' "One Piece" S2 all ';' "Bleach" S1
 emby-dl queue "Show A" S1 -- "Show B" all               # Double-dash delimiter
+# Quote ';' — bash and PowerShell treat an unquoted semicolon as a command separator.
 emby-dl download "Show A, Show B, Show C"               # Comma-separated with download
 
 # 2. File-Based Batch Queues (-f / --file)
@@ -311,6 +312,7 @@ ETA: 00:49
 | `"Show" S2 E5` | Season 2, episode 5. |
 | `"Show" S2 E1-10` | Season 2, episodes 1 through 10. |
 | `"Show" S2 E5-last` | Season 2, episode 5 through the end of the season. |
+| `"Show" S2E3-7` | One-token form: season 2, episodes 3 through 7. |
 
 ---
 

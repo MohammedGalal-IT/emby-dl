@@ -1,6 +1,6 @@
 # emby_dl — Episode Downloader for the Home Emby Server
 
-A robust, single-stream command-line tool that downloads episodes from the home Emby server
+A robust, single-episode command-line tool that downloads episodes from the home Emby server
 (`http://10.10.10.9:8096`, server "الملك2") through its REST API.
 
 It is built for **humans in a terminal** (live progress, readable messages) and for
@@ -8,10 +8,12 @@ It is built for **humans in a terminal** (live progress, readable messages) and 
 
 Core guarantees:
 
-- **One file at a time, machine-wide.** A lock file prevents two downloads from
-  running at once. There is never a parallel transfer.
-- **Exact-size verification.** A file is recorded only when its byte count equals
-  the size the server reports. A size the server cannot report is never trusted.
+- **One episode at a time, machine-wide.** A lock file prevents two download jobs from
+  running at once. HLS may fetch several segments of that single episode concurrently,
+  but two episodes never download in parallel.
+- **Verified downloads.** Direct mode records a file only when its byte count equals
+  the server's reported size. HLS mode verifies duration and records the exact remuxed
+  size. A size the server cannot report is never trusted.
 - **Atomic files.** Data is written to `<name>.part` and renamed only after
   verification, so a killed process can never leave a half-file with a final name.
 - **Single atomic dataset commit.** The central dataset (schema v3) is the single
@@ -68,7 +70,9 @@ Config file search order (first match wins):
 5. `~/.config/emby_dl/config.json`
 6. `./downloads/.emby_config` (legacy bash config, read-only fallback)
 
-The real config is `config.json` at the project root and must be mode `600`.
+The real config is `config.json` at the project root and should be mode `600`. A fresh
+git checkout may arrive as `644`; run `chmod 600 config.json` (Windows ACLs are checked
+differently by `doctor`).
 
 ### 1.2 Complete config reference
 
@@ -114,8 +118,10 @@ The real config is `config.json` at the project root and must be mode `600`.
 }
 ```
 
-`server_url` and `access_token` are required. `server_id`, `user_id` and
-`username` are informational but used by `auth` and `login`.
+`server_url` is required. `access_token` may be empty when `username` is set: the tool
+authenticates automatically (the home account is passwordless) and uses the returned
+token for that run. `server_id`, `user_id` and `username` are informational but used by
+`auth` and `login`.
 
 These defaults match the home-server profile exactly: the tool is tuned for the
 `http://10.10.10.9:8096` Emby 4.9 server out of the box (HLS mode, long stall
@@ -124,7 +130,8 @@ behaviour without editing anything.
 
 `downloads_path` may be relative; it always resolves against the directory that
 contains the config file. `--downloads-dir` overrides it for one run (relative to
-the CWD in that case).
+the CWD in that case). A Windows path used on POSIX is not absolute there, so it
+resolves to a literal `D:\...` directory; set a POSIX path instead.
 
 #### Download settings
 
@@ -168,8 +175,9 @@ the CWD in that case).
 | `notify_on_start` | `false` | notify on queue/batch start |
 | `notify_on_complete` | `true` | notify when a batch has no failures |
 | `notify_on_failure` | `true` | notify when at least one item fails |
+| `stall_alert_seconds` | `300` | send a stall alert after this many seconds without progress |
 
-Telegram is supported both via webhook and via native bot integration (`telegram_bot_token` + `telegram_chat_id`). When `telegram_bot_token` is configured, a background bot thread automatically responds to `/status`, `/help`, and `/ping` commands in Telegram with live progress and ETA.
+Telegram is supported both via webhook and via native bot integration (`telegram_bot_token` + `telegram_chat_id`). When `telegram_bot_token` is configured, a background bot thread automatically responds to `/status`, `/queue`, `/help`, and `/ping` commands in Telegram with live progress and ETA.
 
 `--notify` enables desktop notifications for one run. `--webhook URL` overrides the
 webhook for one run. Neither changes the config file.
@@ -392,7 +400,7 @@ emby-dl queue add "Black Clover" S1 --series-id 276491
 emby-dl queue add "Attack on Titan" S4 --series-id 12345 --source max
 
 # 4. Direct Multi-Series CLI Queue
-emby-dl queue "Show A" S1 --series-id 111 ; "Show B" all --series-id 222
+emby-dl queue "Show A" S1 --series-id 111 ';' "Show B" all --series-id 222
 
 # 5. Queue Text Files (-f / --file)
 # Inline --series-id can be specified directly on any line:
@@ -490,7 +498,8 @@ Multiple series can be specified directly on the command line:
 emby-dl queue "فنون سارا The Art of Sarah" "The Flower of Evil - زهرة الشر" "لعبة الهرم Pyramid Game"
 
 # Download with per-series episode ranges using ';' as delimiter
-emby-dl queue "Show A" S1 ; "Show B" all ; "Show C" S2 E1-5
+# (quote it: bash and PowerShell treat an unquoted ';' as a command separator)
+emby-dl queue "Show A" S1 ';' "Show B" all ';' "Show C" S2 E1-5
 
 # Double-dash '--' can also be used as a delimiter between series
 emby-dl queue "Show A" S1 E1-5 -- "Show B" all -- "Show C" S2
@@ -498,6 +507,10 @@ emby-dl queue "Show A" S1 E1-5 -- "Show B" all -- "Show C" S2
 # Comma-separated list with 'download' command
 emby-dl download "Show A, Show B, Show C"
 ```
+
+> **Shell note:** always quote the `;` delimiter (`';'`) or wrap the entire queue in one
+> quoted string. Unquoted, bash and PowerShell split the command at `;` and only the
+> first series runs.
 
 #### 3.6.2 File-Based Queues (`-f / --file`)
 
@@ -592,9 +605,11 @@ emby-dl queue clear --help    # Guide for clearing the queue
 To ensure maximum download completion without human babysitting, `emby-dl` implements
 a **Three-Level Failure Rescheduling Architecture**:
 
-1. **Level 1 — Micro-Retry with Backoff:**
+1. **Level 1 — Per-File Retries with Backoff:**
    When an episode encounters an error (transient network glitch, transcode startup delay, or socket timeout),
-   it is retried up to 3 times with exponential backoff (e.g. 5s, 10s) and an extended 60s API timeout.
+   it is retried up to `max_retries` times (default 5). Direct mode uses health-gated exponential
+   backoff (`retry_backoff_initial_seconds`, default 15 s, doubling up to `retry_backoff_max_seconds`,
+   default 600 s); HLS mode retries after a short pause and resumes only the missing segments.
 2. **Level 2 — Intra-Series Queue Rescheduling:**
    If an episode still fails after Level 1 retries, it is **not abandoned**. It is automatically
    moved to the **end of the current series queue** (`pending_queue.append(failed_item)`).
@@ -696,12 +711,14 @@ For every item:
 1. **Re-resolve size** from `MediaSources[0].Size`; if missing, fetch item detail;
    if still missing, one short HEAD; if still unknown → fail, record nothing.
 2. **Check disk** (`free - disk_reserve_bytes >= file size`) → exit `6` if not.
-3. **If the final file exists and is byte-exact** → skip (or self-heal the dataset).
+3. **If the final file exists and matches** the server size (direct) or the recorded
+   size (HLS) → skip (or self-heal the dataset).
 4. **If a `.part` file exists** → one short Range probe. No progress or a bad
    response → delete it and download fresh.
 5. **Download** with `curl -f -L --speed-limit … --speed-time …` into `.part` (or HLS segment fetcher).
 6. **Validate** HTTP status (200/206), content type (reject `text/`, JSON, XML,
-   HTML), curl exit code, and exact byte count.
+   HTML), curl exit code, and, in direct mode, the exact byte count. HLS mode instead
+   verifies the remuxed duration against the playlist duration.
 7. **Rename** `.part` → final name atomically and write the dataset entry.
 
 Any HTTP 401/403 exits `3` (auth). HTTP 5xx and connection failures retry with
@@ -855,7 +872,7 @@ Dataset-vs-disk rules:
 
 - complete file + missing record → record it (`HEAL`, no transfer)
 - record + missing file → download again (`MISS`); v1 skipped forever, v1.1 fixes this
-- partial `.part` → probe once, then fresh; never recorded until byte-exact
+- partial `.part` → probe once, then fresh; never recorded until verified (exact size in direct mode, duration in HLS mode)
 
 ---
 
@@ -987,7 +1004,11 @@ own "not found" messages are explicit.
 | `hls_error: timed out` | server transcode spin-up delay → automatically retried with 60s timeout, or supply `--series-id` to bypass database search |
 | `hls_error: duration mismatch` | Emby boundary frame padding → automatically handled by `max(90.0, expected * 0.03)` tolerance |
 | `Can't write packet with unknown timestamp` | Emby HLS video packets lack timestamps → automatically repaired by lossless MP4 intermediate (`TS -> MP4 -> MKV/MP4`) |
-| `/queue command says Unknown command` | running bot process loaded older code in memory → restart the session to reload bytecode; `/setMyCommands` registers it automatically |
+| The `/queue` command says `Unknown command` | running bot process loaded older code in memory → restart the session to reload bytecode; `setMyCommands` registers it automatically |
+| `doctor` exits 1 with `config_permissions 0o644` | tracked config is group/world-readable → `chmod 600 config.json` |
+| `verify` reports `size_mismatch` for HLS files | `verify` compares against the server's source size, while HLS output is a remux of a different size. `dataset --check` is authoritative for HLS entries; `verify --fix` marks them fixed without re-downloading. |
+| a `D:\...` folder appears on Linux/macOS | `downloads_path` holds a Windows path; on POSIX it is treated as relative. Set a POSIX path or pass `--downloads-dir`. |
+| `queue ... ; ...` runs only the first series | the shell consumed the semicolon → quote `';'` or the whole list. |
 
 ---
 
@@ -1003,8 +1024,9 @@ python3 -m unittest discover -s tests -v
 Covered: fresh download, skip, HTTP 500, truncated 200, unknown size, stall and
 retry, Range hang, dataset-vs-disk repair, lock exit 5, ambiguity exit 4, invalid
 specs, option/positional reordering (including a missing option value), plan/dry-run,
-verify/--fix, rebuild/stats/prune, webhook, login/auth, search/list, and
-`watch --once`.
+verify/--fix, rebuild/stats/prune, webhook, login/auth, search/list, `watch --once`,
+persistent queue add/list/remove/clear, queue planning from arguments and files, and
+queue-file downloads.
 
 ---
 
@@ -1023,9 +1045,12 @@ tests/
 
 config.json                    # token + settings (chmod 600)
 downloads/
-├── downloaded_dataset.json    # central dataset (v2)
+├── downloaded_dataset.json    # central dataset (v3)
 ├── .emby_dl.lock              # machine-wide lock
 ├── .emby_dl_state.json        # live progress for `status`
+├── .emby_series_cache.json    # series name → ID cache
+├── .download_queue.json       # persistent queue
+├── .queue_state.json          # live queue progress (status/Telegram)
 └── <Series>/
     ├── downloaded_dataset.json
     └── Season N/

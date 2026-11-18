@@ -23,10 +23,10 @@ This skill is a self-contained, definitive operational manual and institutional 
 ## 1. Tool Identity & GitHub Repository
 
 - **Project Name:** `emby-dl` (CLI commands: `emby-dl` and `emby_dl`)
-- **Current Version:** `1.3.0` (2026-11-13)
+- **Current Version:** `1.3.0` (2026-11-13; the v1.3.1 change set ships under this version string)
 - **Official GitHub Repository:** **[https://github.com/MohammedGalal-IT/emby-dl](https://github.com/MohammedGalal-IT/emby-dl)**
 - **License:** MIT
-- **Architecture:** Pure Python 3.10+ standard library + `curl` + `ffmpeg` (zero third-party Python dependencies required).
+- **Architecture:** Pure Python 3.9+ standard library + `curl` + `ffmpeg` (zero third-party Python dependencies required).
 - **Supported Platforms:** Linux, Windows 10/11, macOS.
 
 ---
@@ -104,9 +104,7 @@ When running on the local home network, **`emby-dl` requires zero configuration*
 - **Default Username:** `دخول الاستراحة 2`
 - **Default Server ID:** `335a39030db14fc0919f6da76570e4db`
 - **Default User ID:** `f5d170effc9b40d4a6183b9288c1d055`
-- **Default Downloads Directory:**
-  - Linux / macOS: `~/Downloads/Emby`
-  - Windows: `%USERPROFILE%\Downloads\Emby` (or project root `config.json` `downloads_path`)
+- **Default Downloads Directory:** `./downloads`, resolved against the directory containing the config file (or the current directory when no config exists). Override with `downloads_path` or `--downloads-dir`.
 
 **Automatic Passwordless First-Run Login:**
 The default lounge user (`دخول الاستراحة 2`) has no password. If `access_token` is missing from the local config, the tool automatically contacts `http://10.10.10.9:8096`, obtains a fresh access token, saves it locally, and executes the command seamlessly.
@@ -133,8 +131,9 @@ Environment variables take precedence over configuration files (`CLI flags > ENV
 
 ## 4. Golden Operational Rules for AI Agents
 
-1. **NEVER Run Downloads in Parallel (Single-Stream Guarantee):**
+1. **NEVER Run Download Jobs in Parallel (Single-Episode Guarantee):**
    - Emby servers struggle with simultaneous transcode/stream downloads. `emby-dl` enforces an exclusive machine-wide lock file (`.emby_dl.lock`).
+   - HLS mode may fetch several segments of the *same* episode concurrently (`hls_workers`), but two episodes are never downloaded at once.
    - If another download is active, the tool immediately exits with **code 5**. Do not hammer the command; inspect live progress with `emby-dl status`.
 
 2. **ALWAYS Run `plan --json` Before Initiating Downloads:**
@@ -191,7 +190,7 @@ emby-dl "Series Name" [spec] [--series-id ID] [--source 1|N|max] [--json]
 
 # Multi-series queue execution and management
 emby-dl queue "Show A" "Show B" "Show C" [--json]
-emby-dl queue "Show A" S1 ; "Show B" all [--json]
+emby-dl queue "Show A" S1 ';' "Show B" all [--json]
 emby-dl queue -f queue.txt [--notify] [--json]
 emby-dl queue add "Show A" S1 [--series-id ID] [--source 1|N|max]
 emby-dl queue list [--json]
@@ -263,7 +262,7 @@ AI agents should use the `queue` command when tasks require downloading multiple
 
 ```bash
 # 1. Direct multi-series execution with per-series specs
-emby-dl queue "Show A" S1 ; "Show B" all ; "Show C" S2 E1-5 --json
+emby-dl queue "Show A" S1 ';' "Show B" all ';' "Show C" S2 E1-5 --json
 
 # 2. File-based queue execution (supports inline --series-id on any line)
 emby-dl queue -f queue.txt --json
@@ -287,6 +286,8 @@ The Flower of Evil - زهرة الشر S1 E1-10
 المدينة البعيدة S2 E27-35 --series-id 145070
 المدينة البعيدة S3 all --series-id 145070
 ```
+
+**Default spec:** a queue-file line with no spec (and a direct `queue "Show"` entry) defaults to `all` real seasons, unlike a bare single-series CLI call, which means “first episode”.
 
 **Queue Rescheduling Architecture:**
 - If an individual episode fails, `emby-dl` automatically reschedules it to the end of the series queue (`pending_queue.append(failed_item)`).
@@ -386,4 +387,64 @@ These facts are verified against Emby Server 4.9.x on Windows (host: **المل�
 
 ---
 
-*Last updated: Fri 2026-11-13 | Tool version: emby_dl 1.3.0*
+## 12. Configuration Reference
+
+`config.json` is merged over `DEFAULT_CONFIG`; environment variables override the file, and CLI flags override both. `emby-dl config --json` prints the effective values with secrets masked.
+
+| Key | Default | Purpose |
+|---|---:|---|
+| `server_url` | `http://10.10.10.9:8096` | Emby base URL |
+| `server_id` / `user_id` | home values | informational; used by `auth`/`login` |
+| `access_token` | `""` | optional when `username` is set (auto-auth) |
+| `username` | `دخول الاستراحة 2` | login name |
+| `downloads_path` | `./downloads` | resolved against the config file's directory |
+| `download_settings.download_mode` | `"hls"` | `hls` or `direct` |
+| `download_settings.hls_workers` | `4` | concurrent segment workers (1–8) |
+| `download_settings.hls_segment_retries` | `4` | retries per failed segment |
+| `download_settings.ffmpeg_path` | `""` | explicit ffmpeg; empty = auto-detect |
+| `download_settings.speed_limit_bytes` / `speed_time_seconds` | `1000` / `1800` | curl stall thresholds, **not** a bandwidth cap |
+| `download_settings.max_retries` | `5` | per-file attempts |
+| `download_settings.retry_backoff_initial_seconds` / `retry_backoff_max_seconds` | `15` / `600` | health-gated backoff |
+| `download_settings.resume_enabled` / `resume_stall_seconds` | `false` / `10` | direct-mode Range probe |
+| `download_settings.queue_item_reschedule_rounds` | `2` | intra-series reschedule rounds |
+| `download_settings.disk_reserve_bytes` | `2147483648` | free space kept untouched (2 GiB) |
+| `download_settings.api_timeout_seconds` / `api_retries` | `60` / `3` | API timeout and retries |
+| `download_settings.head_timeout_seconds` | `6` | last-resort HEAD size probe |
+| `download_settings.completion_grace_seconds` | `15` | HLS straggler wait |
+| `download_settings.idle_timeout_seconds` | `3600` | abort a transfer with zero progress |
+| `notifications.desktop` | `true` | desktop notifications |
+| `notifications.webhook_url` | `""` | completion webhook |
+| `notifications.telegram_bot_token` / `telegram_chat_id` | `""` | enables the two-way bot |
+| `notifications.notify_on_start` / `notify_on_complete` / `notify_on_failure` | `false` / `true` / `true` | alert triggers |
+| `notifications.stall_alert_seconds` | `300` | stall alert threshold |
+
+**Config file permissions:** `config.json` should be mode `600` on POSIX. A fresh git checkout can arrive as `644`, which makes `doctor` fail its `config_permissions` check and exit 1; run `chmod 600 config.json`.
+
+---
+
+## 13. Troubleshooting Playbook
+
+| Symptom | Cause / fix |
+|---|---|
+| `Ambiguous series name ... Candidates` | duplicate titles → rerun with `--series-id <id>` |
+| `Authentication failed (HTTP 401)` | token invalid → `emby-dl login --username ...` |
+| `Cannot connect to server` | server restart/outage → rerun; retries are health-gated |
+| exit `5` | another download holds `.emby_dl.lock` → wait or inspect `status` |
+| exit `6` | free space minus `disk_reserve_bytes` is too small → free space or reduce the batch |
+| `size_unknown` | server did not report a size; the tool refuses to record an unverified file |
+| `bad_content_type` | server returned an error page (HTTP 500 `text/plain`) → check auth/server health |
+| `verify` reports `size_mismatch` for HLS files | `verify` compares against the source size; HLS output is a remux. Use `dataset --check` for HLS entries; `verify --fix` accepts the recorded size and does not re-download. |
+| `doctor` exits 1 with `config_permissions 0o644` | `chmod 600 config.json` (fresh checkouts arrive group/world-readable) |
+| a `D:\...` folder appears on Linux/macOS | `downloads_path` is a Windows path; set a POSIX path or pass `--downloads-dir` |
+| `HLS mode needs ffmpeg` | install ffmpeg (`winget install Gyan.FFmpeg`) or set `download_settings.ffmpeg_path` |
+| `hls_error: timed out` | transcode spin-up delay → automatic retry with the 60 s API timeout |
+| `hls_error: duration mismatch` | keyframe padding → tolerance `max(90 s, 3%)`; investigate only if persistent |
+| `Can't write packet with unknown timestamp` | automatic MP4-intermediate repair; if it persists, check the ffmpeg build |
+| `queue ... ; ...` runs only the first series | the shell consumed `;` → quote `';'` or the whole list |
+| Telegram polling frozen / `409 Conflict` | dangling webhook → restart; the bot calls `deleteWebhook` on startup |
+| `/queue` says `Unknown command` | long-running process has old bytecode → restart the process |
+| full-library search times out | pass `--series-id`; `SeriesCache` resolves cached IDs directly |
+
+---
+
+*Last updated: Fri 2026-11-13 | Tool version: emby_dl 1.3.0 (v1.3.1 feature set)*
