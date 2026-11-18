@@ -23,7 +23,7 @@ This skill is a self-contained, definitive operational manual and institutional 
 ## 1. Tool Identity & GitHub Repository
 
 - **Project Name:** `emby-dl` (CLI commands: `emby-dl` and `emby_dl`)
-- **Current Version:** `1.3.2` (2026-11-18)
+- **Current Version:** `1.3.3` (2026-11-18)
 - **Official GitHub Repository:** **[https://github.com/MohammedGalal-IT/emby-dl](https://github.com/MohammedGalal-IT/emby-dl)**
 - **License:** MIT
 - **Architecture:** Pure Python 3.9+ standard library + `curl` + `ffmpeg` (zero third-party Python dependencies required).
@@ -165,7 +165,11 @@ Environment variables take precedence over configuration files (`CLI flags > ENV
    - The tool passes authentication headers to curl via a private temporary configuration file (`.emby_dl_headers`, mode `0600`) with `-K`.
    - The token never appears in process arguments, `/proc/<pid>/cmdline`, or shell histories.
 
-7. **Multi-Level Automatic Failure Rescheduling (Autonomous Resilience):**
+7. **NEVER Commit `config.json`:**
+   - `config.json` is local-only and gitignored; it holds the live Emby access token and Telegram bot token.
+   - Keep real values in `~/.config/emby_dl/config.json` (Linux/macOS) or `%APPDATA%\emby_dl\config.json` (Windows), mode `600` on POSIX. Use `config.example.json` for documentation or sharing.
+
+8. **Multi-Level Automatic Failure Rescheduling (Autonomous Resilience):**
    - Do NOT abort a batch if an individual episode encounters an error. `emby-dl` automatically reschedules failed episodes to the end of the series queue (`pending_queue.append(failed_item)`).
    - The downloader proceeds with remaining episodes and re-attempts failed ones at the end of the series.
    - At the queue level, `emby-dl queue` automatically runs an auto-retry sweep pass over incomplete series.
@@ -418,7 +422,7 @@ These facts are verified against Emby Server 4.9.x on Windows (host: **المل�
 | `notifications.notify_on_start` / `notify_on_complete` / `notify_on_failure` | `false` / `true` / `true` | alert triggers |
 | `notifications.stall_alert_seconds` | `300` | stall alert threshold |
 
-**Config file permissions:** `config.json` should be mode `600` on POSIX. A fresh git checkout can arrive as `644`, which makes `doctor` fail its `config_permissions` check and exit 1; run `chmod 600 config.json`.
+**Config file permissions & secrecy:** `config.json` is local-only and gitignored; never commit it because it holds the Emby token and Telegram bot token. Create it with `emby-dl init`/`login` at `~/.config/emby_dl/config.json` (Linux/macOS) or `%APPDATA%\emby_dl\config.json` (Windows), and keep it mode `600` on POSIX. `doctor` fails its `config_permissions` check otherwise.
 
 ---
 
@@ -447,4 +451,4 @@ These facts are verified against Emby Server 4.9.x on Windows (host: **المل�
 
 ---
 
-*Last updated: Wed 2026-11-18 | Tool version: emby_dl 1.3.2*
+*Last updated: Wed 2026-11-18 | Tool version: emby_dl 1.3.3*

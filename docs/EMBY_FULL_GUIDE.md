@@ -11,7 +11,7 @@ Read this together with [`tools/README.md`](../tools/README.md) (the concise too
 reference) and [`SKILL.md`](../SKILL.md) (the autonomous agent operational skill).
 This document is the "why" behind every "what".
 
-> **Current tool version:** `emby_dl 1.3.2` (2026-11-18). Adds official multi-series
+> **Current tool version:** `emby_dl 1.3.3` (2026-11-18). Adds official multi-series
 > queue management (`emby-dl queue`), persistent queue storage, text-file batch queues (`-f`),
 > Smart Series Resolution Cache (`SeriesCache` with 0.02s lookups), multi-level failure
 > rescheduling (per-file retries, intra-series queue re-ordering, queue sweep pass),
@@ -312,13 +312,19 @@ When `notifications.telegram_bot_token` and `telegram_chat_id` are configured:
 
 ## 10. Change log
 
+### v1.3.3 — 2026-11-18 (Local-only secrets)
+
+- **`config.json` is now local-only and gitignored.** Real Emby/Telegram credentials live in `~/.config/emby_dl/config.json` (Linux/macOS) or `%APPDATA%\emby_dl\config.json` (Windows), never in the repository.
+- **History sanitized:** previously committed access tokens and chat IDs were removed from all reachable Git history and the branch was force-updated. Rotate any credential that was exposed.
+- **`config.example.json`** remains the only tracked template; `emby-dl init`/`login` write the real file with mode `600`.
+
 ### v1.3.2 — 2026-11-18 (Verification & Path Safety)
 
 - **`verify` accepts recorded remux sizes:** an HLS episode whose on-disk size equals the exact size recorded at download time is now `ok` with `verified_against: recorded` instead of a false `size_mismatch`. Truncated or replaced files still fail.
 - **`verify --json`** now reports `recorded_bytes` and `verified_against` (`server` or `recorded`) for every item.
 - **Windows paths are rejected on POSIX:** a `downloads_path` such as `D:\film` now raises a clear config error (exit `3`) instead of silently creating a literal `D:\film` directory. Pass `--downloads-dir` or set a POSIX path.
 - **`queue_item_reschedule_rounds`** added to `DEFAULT_CONFIG` (was already documented and read by the queue engine).
-- **Tracked `config.json`** now carries the Telegram bot token and chat ID used on the Windows workstation, plus explicit queue/stall settings; file mode is `600`.
+- **Local `config.json`** gained explicit queue/stall settings. Live Telegram credentials stay in the local (gitignored) config only.
 - **Version string corrected:** `VERSION` and `pyproject.toml` now report `1.3.2` (v1.3.0/v1.3.1 shipped under the `1.3.0` string).
 
 ### v1.3.1 — 2026-11-13 (Home-Server Profile & HLS Default)
@@ -326,7 +332,7 @@ When `notifications.telegram_bot_token` and `telegram_chat_id` are configured:
 - **HLS became the default `download_mode`**; `direct` remains available and completed episodes are never re-fetched when switching.
 - **ffmpeg auto-detection:** `ffmpeg_path` → `PATH` → known Windows locations, with a fail-fast error before any bytes are transferred when it is missing.
 - **Home-server defaults baked into `DEFAULT_CONFIG`:** server URL, username, 60 s API timeout, 2 GiB disk reserve.
-- **Tracked `config.json`** carrying the home-server profile; ensure it is mode `600` on POSIX.
+- **Home-server profile bundled in `config.json`** (credentials sanitized; the file became local-only in v1.3.3); ensure it is mode `600` on POSIX.
 - Note: at release time `VERSION` and `pyproject.toml` still reported `1.3.0`; the version string was corrected in v1.3.2.
 
 ### v1.3.0 — 2026-11-13 (Multi-Series Queue, HLS Remux Engine & Bot Polish)
@@ -352,4 +358,4 @@ When `notifications.telegram_bot_token` and `telegram_chat_id` are configured:
 
 ---
 
-*Last verified: Wed 2026-11-18 (server 4.9.3.0, tool 1.3.2). Verified across 269 episodes and 147+ GiB.*
+*Last verified: Wed 2026-11-18 (server 4.9.3.0, tool 1.3.3). Verified across 269 episodes and 147+ GiB.*

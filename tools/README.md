@@ -70,9 +70,11 @@ Config file search order (first match wins):
 5. `~/.config/emby_dl/config.json`
 6. `./downloads/.emby_config` (legacy bash config, read-only fallback)
 
-The real config is `config.json` at the project root and should be mode `600`. A fresh
-git checkout may arrive as `644`; run `chmod 600 config.json` (Windows ACLs are checked
-differently by `doctor`).
+`config.json` is local-only and gitignored: it holds live credentials and must never
+be committed. On Linux/macOS the default is `~/.config/emby_dl/config.json`; on Windows
+it is `%APPDATA%\emby_dl\config.json`. Copy `config.example.json` there or run
+`emby-dl init`, then `chmod 600` it on POSIX (Windows ACLs are checked differently by
+`doctor`). A `./config.json` inside a checkout is honored but remains untracked.
 
 ### 1.2 Complete config reference
 
@@ -840,7 +842,7 @@ Schema v3 keys by `series_id` and records exact byte size, season/episode IDs, s
       "size_mb": 559,
       "container": "mkv",
       "attempts": 1,
-      "tool_version": "1.3.2",
+      "tool_version": "1.3.3",
       "duration_minutes": 0.42,
       "downloaded_at": "2026-11-06 10:13"
     }
@@ -1010,7 +1012,7 @@ own "not found" messages are explicit.
 | `hls_error: duration mismatch` | Emby boundary frame padding → automatically handled by `max(90.0, expected * 0.03)` tolerance |
 | `Can't write packet with unknown timestamp` | Emby HLS video packets lack timestamps → automatically repaired by lossless MP4 intermediate (`TS -> MP4 -> MKV/MP4`) |
 | The `/queue` command says `Unknown command` | running bot process loaded older code in memory → restart the session to reload bytecode; `setMyCommands` registers it automatically |
-| `doctor` exits 1 with `config_permissions 0o644` | tracked config is group/world-readable → `chmod 600 config.json` |
+| `doctor` exits 1 with `config_permissions 0o644` | local config is group/world-readable → `chmod 600 ~/.config/emby_dl/config.json` (or your `--config` path) |
 | `verify` reports `size_mismatch` for HLS files | the file no longer matches either the server size or the recorded remux size → rerun `verify --fix`; healthy HLS entries now report `verified_against: recorded` |
 | a `D:\...` folder appears on Linux/macOS | older builds treated the Windows path as relative. Current builds reject it with exit `3`; set a POSIX path or pass `--downloads-dir`. |
 | `queue ... ; ...` runs only the first series | the shell consumed the semicolon → quote `';'` or the whole list. |

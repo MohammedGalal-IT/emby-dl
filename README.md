@@ -85,7 +85,7 @@ cp completions/emby_dl.fish ~/.config/fish/completions/
 
 If you are on the home network, **`emby-dl` works right away** without any setup. It connects to `http://10.10.10.9:8096` using `دخول الاستراحة 2` and downloads to `./downloads` (resolved against the config file's directory, or the current directory when no config exists). All default download settings (HLS mode, stall thresholds, retries, timeouts) are pre-tuned to match the home-server profile — installing on another machine behaves identically out of the box:
 
-> **Using a git checkout on Linux/macOS:** the tracked `config.json` is tuned for the Windows workstation and sets `downloads_path` to `D:\film`. Current builds reject a Windows path on POSIX with exit `3` instead of creating a literal `D:\film` directory. Override it with `--downloads-dir ~/Downloads/Emby` or edit `downloads_path` before downloading.
+> **Configuration is local-only.** `config.json` is gitignored and must never be committed: it holds your Emby access token and Telegram bot token. On Linux/macOS the default path is `~/.config/emby_dl/config.json`; on Windows it is `%APPDATA%\emby_dl\config.json`. Copy `config.example.json` there (or run `emby-dl init`), then `chmod 600` it on POSIX. A `./config.json` inside a checkout is honored but remains untracked.
 
 ```bash
 # Verify connection to the home server

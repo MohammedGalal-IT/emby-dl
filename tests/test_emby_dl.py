@@ -485,7 +485,7 @@ class EmbyToolTest(unittest.TestCase):
         self.assertEqual(entry["series_id"], "s1")
         self.assertEqual(entry["relative_path"],
                          "Alpha Show/Season 1/Alpha Show - S01E01.mkv")
-        self.assertEqual(entry["tool_version"], "1.3.2")
+        self.assertEqual(entry["tool_version"], "1.3.3")
         self.assertGreaterEqual(int(entry["attempts"]), 1)
         series_dataset = json.loads(
             (self.downloads / "Alpha Show" / "downloaded_dataset.json")
@@ -1004,7 +1004,7 @@ class EmbyToolTest(unittest.TestCase):
         self.assertTrue(cache.exists())
         data = json.loads(cache.read_text(encoding="utf-8"))
         self.assertEqual(data["server_name"], "FakeKing")
-        self.assertEqual(data["tool_version"], "1.3.2")
+        self.assertEqual(data["tool_version"], "1.3.3")
         original = data["updated_at"]
 
         # --reset-caps clears the cache; the same command re-probes and
