@@ -755,18 +755,23 @@ tools/emby_dl verify "Black Clover" --series-id 276491
 tools/emby_dl verify "Black Clover" --series-id 276491 --fix
 ```
 
-For each dataset entry it checks: file exists, file size equals the server size,
-and the dataset byte count matches the file. Issues:
+For each dataset entry it checks: the file exists, the file size matches the
+server size **or** the exact size recorded at download time (HLS remuxes
+legitimately differ from the server's source size), and the dataset byte count
+matches the file. Each JSON item reports `expected_bytes` (server),
+`recorded_bytes` (dataset), `disk_bytes`, and `verified_against`
+(`server` or `recorded`). Issues:
 
 | Issue | Meaning |
 |---|---|
 | `missing_file` | recorded but not on disk |
-| `size_mismatch` | truncated or otherwise wrong |
-| `unverified_size` | server did not report a size (cannot confirm) |
+| `source_missing` | the recorded media source no longer exists on the server |
+| `size_mismatch` | file matches neither the server size nor the recorded size (truncated or replaced) |
+| `unverified_size` | server did not report a size and nothing was recorded (cannot confirm) |
 | `dataset_size_stale` | file is fine; dataset byte count is old |
 
-`--fix` re-downloads `missing_file` and `size_mismatch` items and updates stale
-dataset sizes. Exit `0` when no issues remain, `1` otherwise.
+`--fix` re-downloads `missing_file`, `source_missing` and `size_mismatch` items
+and updates stale dataset sizes. Exit `0` when no issues remain, `1` otherwise.
 
 ### 3.13 `watch` — poll for new episodes
 
@@ -835,7 +840,7 @@ Schema v3 keys by `series_id` and records exact byte size, season/episode IDs, s
       "size_mb": 559,
       "container": "mkv",
       "attempts": 1,
-      "tool_version": "1.3.0",
+      "tool_version": "1.3.2",
       "duration_minutes": 0.42,
       "downloaded_at": "2026-11-06 10:13"
     }
@@ -1006,8 +1011,8 @@ own "not found" messages are explicit.
 | `Can't write packet with unknown timestamp` | Emby HLS video packets lack timestamps → automatically repaired by lossless MP4 intermediate (`TS -> MP4 -> MKV/MP4`) |
 | The `/queue` command says `Unknown command` | running bot process loaded older code in memory → restart the session to reload bytecode; `setMyCommands` registers it automatically |
 | `doctor` exits 1 with `config_permissions 0o644` | tracked config is group/world-readable → `chmod 600 config.json` |
-| `verify` reports `size_mismatch` for HLS files | `verify` compares against the server's source size, while HLS output is a remux of a different size. `dataset --check` is authoritative for HLS entries; `verify --fix` marks them fixed without re-downloading. |
-| a `D:\...` folder appears on Linux/macOS | `downloads_path` holds a Windows path; on POSIX it is treated as relative. Set a POSIX path or pass `--downloads-dir`. |
+| `verify` reports `size_mismatch` for HLS files | the file no longer matches either the server size or the recorded remux size → rerun `verify --fix`; healthy HLS entries now report `verified_against: recorded` |
+| a `D:\...` folder appears on Linux/macOS | older builds treated the Windows path as relative. Current builds reject it with exit `3`; set a POSIX path or pass `--downloads-dir`. |
 | `queue ... ; ...` runs only the first series | the shell consumed the semicolon → quote `';'` or the whole list. |
 
 ---

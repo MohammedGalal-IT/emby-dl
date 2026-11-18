@@ -485,7 +485,7 @@ class EmbyToolTest(unittest.TestCase):
         self.assertEqual(entry["series_id"], "s1")
         self.assertEqual(entry["relative_path"],
                          "Alpha Show/Season 1/Alpha Show - S01E01.mkv")
-        self.assertEqual(entry["tool_version"], "1.3.0")
+        self.assertEqual(entry["tool_version"], "1.3.2")
         self.assertGreaterEqual(int(entry["attempts"]), 1)
         series_dataset = json.loads(
             (self.downloads / "Alpha Show" / "downloaded_dataset.json")
@@ -685,6 +685,40 @@ class EmbyToolTest(unittest.TestCase):
         self.assertEqual(report["summary"]["fixed"], 1)
         self.assertEqual(report["summary"]["remaining"], 0)
         self.assertEqual(path.read_bytes(), self.state["payloads"]["e11"])
+
+    def test_verify_accepts_recorded_hls_remux_size(self):
+        first = self.run_tool("Alpha Show", "S1", "E1")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        path = self.dest(1, 1)
+        self.assertEqual(path.stat().st_size, 60_000)
+
+        # Simulate an HLS remux: the server reports its source size, while the
+        # file on disk (and the dataset) records the remuxed size.
+        self.state["episodes"]["se1"][0]["MediaSources"][0]["Size"] = 12_345
+
+        check = self.run_tool("verify", "--json")
+        self.assertEqual(check.returncode, 0, check.stderr)
+        report = self.last_json(check.stdout)
+        self.assertEqual(report["summary"]["issues"], 0)
+        item = report["items"][0]
+        self.assertEqual(item["status"], "ok")
+        self.assertIsNone(item["issue"])
+        self.assertEqual(item["verified_against"], "recorded")
+        self.assertEqual(item["recorded_bytes"], 60_000)
+        self.assertEqual(item["disk_bytes"], 60_000)
+        self.assertEqual(item["expected_bytes"], 12_345)
+        self.assertEqual(self.stream_count("e11"), 1)
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only Windows-path guard")
+    def test_windows_downloads_path_rejected_on_posix(self):
+        self.write_config(downloads_path=r"D:\film")
+
+        result = self.run_tool("dataset", "--stats", "--json")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        payload = self.last_json(result.stdout)
+        self.assertEqual(payload["code"], 3)
+        self.assertIn("Windows path", payload["error"])
+        self.assertFalse((self.tempdir / r"D:\film").exists())
 
     def test_dataset_rebuild_stats_and_prune(self):
         season_dir = self.downloads / "Alpha Show" / "Season 1"
@@ -970,7 +1004,7 @@ class EmbyToolTest(unittest.TestCase):
         self.assertTrue(cache.exists())
         data = json.loads(cache.read_text(encoding="utf-8"))
         self.assertEqual(data["server_name"], "FakeKing")
-        self.assertEqual(data["tool_version"], "1.3.0")
+        self.assertEqual(data["tool_version"], "1.3.2")
         original = data["updated_at"]
 
         # --reset-caps clears the cache; the same command re-probes and

@@ -78,7 +78,7 @@ try:
 except ImportError:
     msvcrt = None
 
-VERSION = "1.3.0"
+VERSION = "1.3.2"
 PROG = "emby_dl"
 SCHEMA_VERSION = 3
 
@@ -105,6 +105,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "download_mode": "hls",
         "hls_workers": 4,
         "hls_segment_retries": 4,
+        "queue_item_reschedule_rounds": 2,
         "ffmpeg_path": "",
         "disk_reserve_bytes": 2 * 1024 ** 3,
         "api_timeout_seconds": 60,
@@ -254,11 +255,24 @@ def load_config(config_arg: Optional[str] = None) -> Dict[str, Any]:
         raise ConfigError(f"Error loading config from {config_path}: {exc}")
 
 
+_WINDOWS_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+
+
 def get_downloads_path(config: Dict[str, Any]) -> str:
     """Absolute downloads path. Relative paths anchor to the config file."""
     path = config.get("downloads_path")
     if not path:
         return get_default_downloads_dir()
+    path = str(path)
+    # A Windows drive/UNC path is not absolute on POSIX, so it would silently
+    # become a directory literally named "D:\film" in the config directory.
+    if os.name != "nt" and _WINDOWS_PATH_RE.match(path):
+        raise ConfigError(
+            f"downloads_path {path!r} is a Windows path, but this system is "
+            f"{platform.system()}. Set downloads_path to a local absolute "
+            f"path or a relative path such as './downloads', or pass "
+            f"--downloads-dir."
+        )
     if not os.path.isabs(path):
         base = config.get("_config_dir") or os.getcwd()
         path = os.path.join(base, path)
@@ -4442,19 +4456,29 @@ def cmd_verify(args: argparse.Namespace, config: Dict[str, Any],
                     )
             except ToolError:
                 detail = {}
+        server_bytes = expected
+        recorded_bytes = parse_int(entry.get("size_bytes"))
         if expected is None:
-            expected = parse_int(entry.get("size_bytes"))
+            expected = recorded_bytes
 
         issue = None
+        verified_against = None
         if not on_disk:
             issue = "missing_file"
         elif source_missing:
             issue = "source_missing"
-        elif expected is None:
+        elif server_bytes is None and recorded_bytes is None:
             issue = "unverified_size"
-        elif disk_bytes != expected:
+        elif server_bytes is not None and disk_bytes == server_bytes:
+            verified_against = "server"
+        elif recorded_bytes is not None and disk_bytes == recorded_bytes:
+            # A remuxed HLS file legitimately differs from the server source
+            # size. Trust the exact size recorded when the download completed.
+            verified_against = "recorded"
+        else:
             issue = "size_mismatch"
-        elif parse_int(entry.get("size_bytes")) != disk_bytes:
+        if issue is None and recorded_bytes is not None \
+                and recorded_bytes != disk_bytes:
             issue = "dataset_size_stale"
 
         result = {
@@ -4468,7 +4492,9 @@ def cmd_verify(args: argparse.Namespace, config: Dict[str, Any],
             "media_source_id": entry.get("media_source_id"),
             "path": os.path.relpath(path, downloads_path).replace("\\", "/"),
             "expected_bytes": expected,
+            "recorded_bytes": recorded_bytes,
             "disk_bytes": disk_bytes,
+            "verified_against": verified_against,
             "status": "ok" if issue is None else "issue",
             "issue": issue,
         }
@@ -4534,6 +4560,8 @@ def cmd_verify(args: argparse.Namespace, config: Dict[str, Any],
                                 if result.get("size_bytes"):
                                     entry["disk_bytes"] = result["size_bytes"]
                                     entry["expected_bytes"] = result["size_bytes"]
+                                    entry["recorded_bytes"] = result["size_bytes"]
+                                    entry["verified_against"] = "recorded"
                     else:
                         remaining += 1
         # Dataset-only drift: update byte counts from disk without downloading.

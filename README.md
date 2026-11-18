@@ -85,7 +85,7 @@ cp completions/emby_dl.fish ~/.config/fish/completions/
 
 If you are on the home network, **`emby-dl` works right away** without any setup. It connects to `http://10.10.10.9:8096` using `دخول الاستراحة 2` and downloads to `./downloads` (resolved against the config file's directory, or the current directory when no config exists). All default download settings (HLS mode, stall thresholds, retries, timeouts) are pre-tuned to match the home-server profile — installing on another machine behaves identically out of the box:
 
-> **Using a git checkout on Linux/macOS:** the tracked `config.json` is tuned for the Windows workstation and sets `downloads_path` to `D:\film`. Override it with `--downloads-dir ~/Downloads/Emby` or edit `downloads_path` before downloading.
+> **Using a git checkout on Linux/macOS:** the tracked `config.json` is tuned for the Windows workstation and sets `downloads_path` to `D:\film`. Current builds reject a Windows path on POSIX with exit `3` instead of creating a literal `D:\film` directory. Override it with `--downloads-dir ~/Downloads/Emby` or edit `downloads_path` before downloading.
 
 ```bash
 # Verify connection to the home server

@@ -23,7 +23,7 @@ This skill is a self-contained, definitive operational manual and institutional 
 ## 1. Tool Identity & GitHub Repository
 
 - **Project Name:** `emby-dl` (CLI commands: `emby-dl` and `emby_dl`)
-- **Current Version:** `1.3.0` (2026-11-13; the v1.3.1 change set ships under this version string)
+- **Current Version:** `1.3.2` (2026-11-18)
 - **Official GitHub Repository:** **[https://github.com/MohammedGalal-IT/emby-dl](https://github.com/MohammedGalal-IT/emby-dl)**
 - **License:** MIT
 - **Architecture:** Pure Python 3.9+ standard library + `curl` + `ffmpeg` (zero third-party Python dependencies required).
@@ -397,7 +397,7 @@ These facts are verified against Emby Server 4.9.x on Windows (host: **المل�
 | `server_id` / `user_id` | home values | informational; used by `auth`/`login` |
 | `access_token` | `""` | optional when `username` is set (auto-auth) |
 | `username` | `دخول الاستراحة 2` | login name |
-| `downloads_path` | `./downloads` | resolved against the config file's directory |
+| `downloads_path` | `./downloads` | resolved against the config file's directory; a Windows drive/UNC path on POSIX is rejected with exit `3` |
 | `download_settings.download_mode` | `"hls"` | `hls` or `direct` |
 | `download_settings.hls_workers` | `4` | concurrent segment workers (1–8) |
 | `download_settings.hls_segment_retries` | `4` | retries per failed segment |
@@ -433,9 +433,9 @@ These facts are verified against Emby Server 4.9.x on Windows (host: **المل�
 | exit `6` | free space minus `disk_reserve_bytes` is too small → free space or reduce the batch |
 | `size_unknown` | server did not report a size; the tool refuses to record an unverified file |
 | `bad_content_type` | server returned an error page (HTTP 500 `text/plain`) → check auth/server health |
-| `verify` reports `size_mismatch` for HLS files | `verify` compares against the source size; HLS output is a remux. Use `dataset --check` for HLS entries; `verify --fix` accepts the recorded size and does not re-download. |
+| `verify` reports `size_mismatch` for HLS files | the file matches neither the server size nor the recorded remux size → rerun `verify --fix`; healthy HLS entries report `verified_against: recorded` |
 | `doctor` exits 1 with `config_permissions 0o644` | `chmod 600 config.json` (fresh checkouts arrive group/world-readable) |
-| a `D:\...` folder appears on Linux/macOS | `downloads_path` is a Windows path; set a POSIX path or pass `--downloads-dir` |
+| a `D:\...` folder appears on Linux/macOS | older builds treated the Windows path as relative. Current builds reject it with exit `3`; set a POSIX path or pass `--downloads-dir` |
 | `HLS mode needs ffmpeg` | install ffmpeg (`winget install Gyan.FFmpeg`) or set `download_settings.ffmpeg_path` |
 | `hls_error: timed out` | transcode spin-up delay → automatic retry with the 60 s API timeout |
 | `hls_error: duration mismatch` | keyframe padding → tolerance `max(90 s, 3%)`; investigate only if persistent |
@@ -447,4 +447,4 @@ These facts are verified against Emby Server 4.9.x on Windows (host: **المل�
 
 ---
 
-*Last updated: Fri 2026-11-13 | Tool version: emby_dl 1.3.0 (v1.3.1 feature set)*
+*Last updated: Wed 2026-11-18 | Tool version: emby_dl 1.3.2*

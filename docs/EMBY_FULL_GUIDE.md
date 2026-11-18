@@ -11,7 +11,7 @@ Read this together with [`tools/README.md`](../tools/README.md) (the concise too
 reference) and [`SKILL.md`](../SKILL.md) (the autonomous agent operational skill).
 This document is the "why" behind every "what".
 
-> **Current tool version:** `emby_dl 1.3.0` (2026-11-13; the v1.3.1 change set ships under this version string). Adds official multi-series
+> **Current tool version:** `emby_dl 1.3.2` (2026-11-18). Adds official multi-series
 > queue management (`emby-dl queue`), persistent queue storage, text-file batch queues (`-f`),
 > Smart Series Resolution Cache (`SeriesCache` with 0.02s lookups), multi-level failure
 > rescheduling (per-file retries, intra-series queue re-ordering, queue sweep pass),
@@ -306,11 +306,20 @@ When `notifications.telegram_bot_token` and `telegram_chat_id` are configured:
 13. **HLS transcode startup requires extended timeouts** — use `api_timeout_seconds: 60` and `api_retries: 3`.
 14. **Process memory does not update on file edit** — a running Python process keeps old bytecode in RAM until restarted.
 15. **Filter queue progress by target series IDs** — simple `len(dataset)` counts past history rather than active queue progress.
-16. **`verify` compares against the source size, not the HLS remux size** — HLS output legitimately differs, so `verify` can report false `size_mismatch` results. Use `dataset --check` as the authoritative HLS check; `verify --fix` accepts the recorded size and does not re-download.
+16. **HLS remux size differs from the server source size** — `verify` accepts the exact byte count recorded at download time for such entries (`verified_against: recorded`) instead of flagging a false `size_mismatch`. A real mismatch still means the file matches neither the server size nor the recorded size; run `verify --fix`.
 
 ---
 
 ## 10. Change log
+
+### v1.3.2 — 2026-11-18 (Verification & Path Safety)
+
+- **`verify` accepts recorded remux sizes:** an HLS episode whose on-disk size equals the exact size recorded at download time is now `ok` with `verified_against: recorded` instead of a false `size_mismatch`. Truncated or replaced files still fail.
+- **`verify --json`** now reports `recorded_bytes` and `verified_against` (`server` or `recorded`) for every item.
+- **Windows paths are rejected on POSIX:** a `downloads_path` such as `D:\film` now raises a clear config error (exit `3`) instead of silently creating a literal `D:\film` directory. Pass `--downloads-dir` or set a POSIX path.
+- **`queue_item_reschedule_rounds`** added to `DEFAULT_CONFIG` (was already documented and read by the queue engine).
+- **Tracked `config.json`** now carries the Telegram bot token and chat ID used on the Windows workstation, plus explicit queue/stall settings; file mode is `600`.
+- **Version string corrected:** `VERSION` and `pyproject.toml` now report `1.3.2` (v1.3.0/v1.3.1 shipped under the `1.3.0` string).
 
 ### v1.3.1 — 2026-11-13 (Home-Server Profile & HLS Default)
 
@@ -318,7 +327,7 @@ When `notifications.telegram_bot_token` and `telegram_chat_id` are configured:
 - **ffmpeg auto-detection:** `ffmpeg_path` → `PATH` → known Windows locations, with a fail-fast error before any bytes are transferred when it is missing.
 - **Home-server defaults baked into `DEFAULT_CONFIG`:** server URL, username, 60 s API timeout, 2 GiB disk reserve.
 - **Tracked `config.json`** carrying the home-server profile; ensure it is mode `600` on POSIX.
-- Note: `VERSION` and `pyproject.toml` still report `1.3.0`; there is no git tag or GitHub release for v1.3.1.
+- Note: at release time `VERSION` and `pyproject.toml` still reported `1.3.0`; the version string was corrected in v1.3.2.
 
 ### v1.3.0 — 2026-11-13 (Multi-Series Queue, HLS Remux Engine & Bot Polish)
 
@@ -343,4 +352,4 @@ When `notifications.telegram_bot_token` and `telegram_chat_id` are configured:
 
 ---
 
-*Last verified: Fri 2026-11-13 (server 4.9.3.0, tool 1.3.0 / v1.3.1 feature set). Verified across 269 episodes and 147+ GiB.*
+*Last verified: Wed 2026-11-18 (server 4.9.3.0, tool 1.3.2). Verified across 269 episodes and 147+ GiB.*
