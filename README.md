@@ -179,10 +179,11 @@ Download, plan, and automate multiple series in a single command, from a queue f
 
 ```bash
 # 1. Direct Multi-Series Execution (one command)
-emby-dl queue "Black Clover" "One Piece" "Bleach"
-emby-dl queue "Black Clover" S1 E1-10 ';' "One Piece" S2 all ';' "Bleach" S1
+# Cross-shell safe: quote each series name and each spec token; no delimiter needed.
+emby-dl queue "Show A" "S1 E1-5" "Show B" "all" "Show C" "S2E3-7" --json
+# ';' works too, but MUST be quoted in bash/PowerShell (unquoted ';' splits the command).
+emby-dl queue "Show A" S1 E1-5 ';' "Show B" all ';' "Show C" S2 E1-5 --json
 emby-dl queue "Show A" S1 -- "Show B" all               # Double-dash delimiter
-# Quote ';' — bash and PowerShell treat an unquoted semicolon as a command separator.
 emby-dl download "Show A, Show B, Show C"               # Comma-separated with download
 
 # 2. File-Based Batch Queues (-f / --file)
@@ -194,7 +195,16 @@ emby-dl download -f my_shows.txt
 emby-dl queue plan "Black Clover" "One Piece"
 emby-dl queue plan -f my_shows.txt
 emby-dl plan -f my_shows.txt
+```
 
+> **Queue safety:** a quoted spec such as `"S1 E24"` is parsed as a spec, not a series
+> name. Any unresolved or invalid queue item aborts the entire queue with exit `4`
+> **before** a single transfer starts. In `--json` mode the first event is `start`,
+> carrying `total_series`, `total_episodes`, `todo_episodes`, `total_bytes`, and
+> `unknown_sizes`. A bare series name in a queue means **all** missing episodes; pass an
+> explicit spec whenever you only want a few.
+
+```bash
 # 4. Persistent Queue Lifecycle (stored in .download_queue.json)
 emby-dl queue add "Black Clover" S1                     # Add series to queue
 emby-dl queue add "One Piece" S2 all --source max       # Add with max quality

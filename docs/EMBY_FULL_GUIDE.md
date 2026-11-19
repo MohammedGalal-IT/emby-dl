@@ -11,7 +11,7 @@ Read this together with [`tools/README.md`](../tools/README.md) (the concise too
 reference) and [`SKILL.md`](../SKILL.md) (the autonomous agent operational skill).
 This document is the "why" behind every "what".
 
-> **Current tool version:** `emby_dl 1.3.3` (2026-11-18). Adds official multi-series
+> **Current tool version:** `emby_dl 1.3.4` (2026-11-20). Adds official multi-series
 > queue management (`emby-dl queue`), persistent queue storage, text-file batch queues (`-f`),
 > Smart Series Resolution Cache (`SeriesCache` with 0.02s lookups), multi-level failure
 > rescheduling (per-file retries, intra-series queue re-ordering, queue sweep pass),
@@ -307,10 +307,22 @@ When `notifications.telegram_bot_token` and `telegram_chat_id` are configured:
 14. **Process memory does not update on file edit** — a running Python process keeps old bytecode in RAM until restarted.
 15. **Filter queue progress by target series IDs** — simple `len(dataset)` counts past history rather than active queue progress.
 16. **HLS remux size differs from the server source size** — `verify` accepts the exact byte count recorded at download time for such entries (`verified_against: recorded`) instead of flagging a false `size_mismatch`. A real mismatch still means the file matches neither the server size nor the recorded size; run `verify --fix`.
+17. **A bare series in a queue means `all` missing episodes** — always pass an explicit spec when you only want a few. Quoted combined specs (`"S1 E24"`) are recognized; unresolved items abort the whole queue with exit `4` before any transfer.
+18. **Unquoted `;` is not portable** — bash and PowerShell treat it as a command separator. Use quoted series/spec tokens with no delimiter, quote `';'`, or use `--`.
 
 ---
 
 ## 10. Change log
+
+### v1.3.4 — 2026-11-20 (Queue fail-fast & parser hardening)
+
+- **Quoted combined specs are parsed correctly:** a single argv token such as `"S1 E24"` or `"S1 E1-5"` is split into its spec parts instead of being mistaken for a series name. This works in the no-delimiter queue form, the `;`/`--` delimiter forms, and queue files.
+- **Queue aborts before any transfer on bad input:** unresolved series, ambiguous names, and invalid specs now raise one `UsageError` (exit `4`) listing every bad item. Previously a warning was printed and the remaining series downloaded anyway — the root cause of the 2026-11-14 mass-download report. `queue plan` fails the same way.
+- **Queue `start` event:** `--json` queue runs now emit a `start` event before the first transfer with `total_series`, `total_episodes`, `todo_episodes`, `total_bytes`, and `unknown_sizes`, matching the single-series `start` event.
+- **Stale status state is invalidated:** `status --json` checks the lock and the recorded PID; a dead PID is reported as `running: false`, `stale: true` instead of a ghost running download.
+- **Cross-shell queue docs:** primary examples now use quoted series/spec tokens with no delimiter (works in bash, PowerShell, and cmd.exe); the `';'` form is kept with an explicit shell warning.
+- **Stray specs are rejected:** a spec token with no preceding series name now raises exit `4` instead of being dropped (which could make the next bare series default to `all`).
+- **Eight regression tests** cover combined specs, no-swallow multi-series parsing, fail-fast for `queue` and `queue plan`, the start event, and dead-PID status.
 
 ### v1.3.3 — 2026-11-18 (Local-only secrets)
 
@@ -358,4 +370,4 @@ When `notifications.telegram_bot_token` and `telegram_chat_id` are configured:
 
 ---
 
-*Last verified: Wed 2026-11-18 (server 4.9.3.0, tool 1.3.3). Verified across 269 episodes and 147+ GiB.*
+*Last verified: Fri 2026-11-20 (server 4.9.3.0, tool 1.3.4). Verified across 269 episodes and 147+ GiB.*

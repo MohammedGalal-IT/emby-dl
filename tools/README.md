@@ -496,11 +496,14 @@ dozens of series in a single command, from a text file, or by building a persist
 Multiple series can be specified directly on the command line:
 
 ```bash
-# Download multiple series in one command (downloads 'all' real seasons by default)
+# Cross-shell safe (bash, PowerShell, cmd.exe): quote each series name and spec token.
+# No delimiter is needed; a quoted spec such as "S1 E1-5" is parsed as a spec.
+emby-dl queue "Show A" "S1 E1-5" "Show B" "all" "Show C" "S2E3-7" --json
+
+# Bare series names in a queue default to 'all' missing episodes:
 emby-dl queue "فنون سارا The Art of Sarah" "The Flower of Evil - زهرة الشر" "لعبة الهرم Pyramid Game"
 
-# Download with per-series episode ranges using ';' as delimiter
-# (quote it: bash and PowerShell treat an unquoted ';' as a command separator)
+# ';' is also supported as an explicit delimiter, but MUST be quoted:
 emby-dl queue "Show A" S1 ';' "Show B" all ';' "Show C" S2 E1-5
 
 # Double-dash '--' can also be used as a delimiter between series
@@ -510,9 +513,14 @@ emby-dl queue "Show A" S1 E1-5 -- "Show B" all -- "Show C" S2
 emby-dl download "Show A, Show B, Show C"
 ```
 
-> **Shell note:** always quote the `;` delimiter (`';'`) or wrap the entire queue in one
-> quoted string. Unquoted, bash and PowerShell split the command at `;` and only the
-> first series runs.
+> **Shell note:** `;` is a command separator in bash/PowerShell and only passes through
+> unquoted in cmd.exe. Quote it (`';'`) or use the no-delimiter form above.
+>
+> **Fail-fast:** any unresolved series or invalid spec aborts the entire queue with exit
+> `4` before any transfer. In `--json` mode the first event is `start` with
+> `total_series`, `total_episodes`, `todo_episodes`, `total_bytes`, and `unknown_sizes`,
+> so an agent can verify the plan before the first byte moves. Always pass an explicit
+> spec: a bare series name in a queue selects **all** missing episodes.
 
 #### 3.6.2 File-Based Queues (`-f / --file`)
 
@@ -842,7 +850,7 @@ Schema v3 keys by `series_id` and records exact byte size, season/episode IDs, s
       "size_mb": 559,
       "container": "mkv",
       "attempts": 1,
-      "tool_version": "1.3.3",
+      "tool_version": "1.3.4",
       "duration_minutes": 0.42,
       "downloaded_at": "2026-11-06 10:13"
     }
@@ -1015,7 +1023,8 @@ own "not found" messages are explicit.
 | `doctor` exits 1 with `config_permissions 0o644` | local config is group/world-readable → `chmod 600 ~/.config/emby_dl/config.json` (or your `--config` path) |
 | `verify` reports `size_mismatch` for HLS files | the file no longer matches either the server size or the recorded remux size → rerun `verify --fix`; healthy HLS entries now report `verified_against: recorded` |
 | a `D:\...` folder appears on Linux/macOS | older builds treated the Windows path as relative. Current builds reject it with exit `3`; set a POSIX path or pass `--downloads-dir`. |
-| `queue ... ; ...` runs only the first series | the shell consumed the semicolon → quote `';'` or the whole list. |
+| `queue ... ; ...` runs only the first series | the shell consumed the semicolon → quote `';'` or use quoted spec tokens with no delimiter. |
+| `queue` exits `4` with "unresolved or invalid queue items" | a token was treated as a series name (often a quoted spec without a preceding series) → fix the args; nothing was downloaded. |
 
 ---
 

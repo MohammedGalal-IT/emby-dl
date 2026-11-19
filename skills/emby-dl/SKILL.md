@@ -23,7 +23,7 @@ This skill is a self-contained, definitive operational manual and institutional 
 ## 1. Tool Identity & GitHub Repository
 
 - **Project Name:** `emby-dl` (CLI commands: `emby-dl` and `emby_dl`)
-- **Current Version:** `1.3.3` (2026-11-18)
+- **Current Version:** `1.3.4` (2026-11-20)
 - **Official GitHub Repository:** **[https://github.com/MohammedGalal-IT/emby-dl](https://github.com/MohammedGalal-IT/emby-dl)**
 - **License:** MIT
 - **Architecture:** Pure Python 3.9+ standard library + `curl` + `ffmpeg` (zero third-party Python dependencies required).
@@ -266,6 +266,9 @@ AI agents should use the `queue` command when tasks require downloading multiple
 
 ```bash
 # 1. Direct multi-series execution with per-series specs
+# Cross-shell safe: quote series names and spec tokens; no delimiter required.
+emby-dl queue "Show A" "S1 E1-5" "Show B" "all" "Show C" "S2E3-7" --json
+# ';' also works when quoted (unquoted ';' breaks bash and PowerShell):
 emby-dl queue "Show A" S1 ';' "Show B" all ';' "Show C" S2 E1-5 --json
 
 # 2. File-based queue execution (supports inline --series-id on any line)
@@ -280,6 +283,14 @@ emby-dl queue run --json
 # 4. Queue dry-run planning & total disk calculation
 emby-dl queue plan -f queue.txt --json
 ```
+
+**Queue safety rules:**
+- A quoted spec token such as `"S1 E24"` is parsed as a spec, never as a series name.
+- Any unresolved series or invalid spec aborts the whole queue with exit `4` **before**
+  any transfer starts. Never tolerate a "could not resolve" warning.
+- With `--json`, the first event is `start` with `total_series`, `total_episodes`,
+  `todo_episodes`, `total_bytes`, and `unknown_sizes`. Check it before proceeding.
+- A bare series name in a queue means **all** missing episodes; always pass a spec.
 
 **Queue File Syntax (`queue.txt`):**
 ```text
@@ -438,17 +449,18 @@ These facts are verified against Emby Server 4.9.x on Windows (host: **المل�
 | `size_unknown` | server did not report a size; the tool refuses to record an unverified file |
 | `bad_content_type` | server returned an error page (HTTP 500 `text/plain`) → check auth/server health |
 | `verify` reports `size_mismatch` for HLS files | the file matches neither the server size nor the recorded remux size → rerun `verify --fix`; healthy HLS entries report `verified_against: recorded` |
-| `doctor` exits 1 with `config_permissions 0o644` | `chmod 600 config.json` (fresh checkouts arrive group/world-readable) |
+| `doctor` exits 1 with `config_permissions 0o644` | `chmod 600 ~/.config/emby_dl/config.json` (or your `--config` path) |
 | a `D:\...` folder appears on Linux/macOS | older builds treated the Windows path as relative. Current builds reject it with exit `3`; set a POSIX path or pass `--downloads-dir` |
 | `HLS mode needs ffmpeg` | install ffmpeg (`winget install Gyan.FFmpeg`) or set `download_settings.ffmpeg_path` |
 | `hls_error: timed out` | transcode spin-up delay → automatic retry with the 60 s API timeout |
 | `hls_error: duration mismatch` | keyframe padding → tolerance `max(90 s, 3%)`; investigate only if persistent |
 | `Can't write packet with unknown timestamp` | automatic MP4-intermediate repair; if it persists, check the ffmpeg build |
-| `queue ... ; ...` runs only the first series | the shell consumed `;` → quote `';'` or the whole list |
+| `queue ... ; ...` runs only the first series | the shell consumed `;` → quote `';'` or use quoted spec tokens with no delimiter |
+| `queue` exits `4` with "unresolved or invalid queue items" | a token was treated as a series name; fix the args — nothing was downloaded |
 | Telegram polling frozen / `409 Conflict` | dangling webhook → restart; the bot calls `deleteWebhook` on startup |
 | `/queue` says `Unknown command` | long-running process has old bytecode → restart the process |
 | full-library search times out | pass `--series-id`; `SeriesCache` resolves cached IDs directly |
 
 ---
 
-*Last updated: Wed 2026-11-18 | Tool version: emby_dl 1.3.3*
+*Last updated: Fri 2026-11-20 | Tool version: emby_dl 1.3.4*

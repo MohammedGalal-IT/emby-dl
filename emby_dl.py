@@ -78,7 +78,7 @@ try:
 except ImportError:
     msvcrt = None
 
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 PROG = "emby_dl"
 SCHEMA_VERSION = 3
 
@@ -3663,6 +3663,36 @@ def is_spec_token(token: str) -> bool:
     return False
 
 
+def _strip_wrapping_quotes(text: str) -> str:
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        return text[1:-1].strip()
+    return text
+
+
+def split_combined_spec_token(token: str) -> List[str]:
+    """Split a quoted spec expression such as ``"S1 E24"`` into real tokens.
+
+    A token is only split when every whitespace-separated part is itself a
+    valid single spec token. Real series names with spaces are left untouched.
+    """
+    text = _strip_wrapping_quotes(token)
+    if not any(char.isspace() for char in text):
+        return [token]
+    parts = text.split()
+    if parts and all(is_spec_token(part) for part in parts):
+        return parts
+    return [token]
+
+
+def expand_spec_tokens(tokens: List[str]) -> List[str]:
+    """Normalize argv/file tokens so combined spec tokens are recognized."""
+    expanded: List[str] = []
+    for token in tokens:
+        expanded.extend(split_combined_spec_token(token))
+    return expanded
+
+
 def parse_series_and_spec_line(line: str) -> Optional[QueueItem]:
     """Parse one line of text into a QueueItem."""
     raw = line.strip()
@@ -3702,6 +3732,7 @@ def parse_series_and_spec_line(line: str) -> Optional[QueueItem]:
     if not clean_tokens:
         return None
 
+    clean_tokens = expand_spec_tokens(clean_tokens)
     spec_tokens: List[str] = []
     while clean_tokens and is_spec_token(clean_tokens[-1]):
         spec_tokens.insert(0, clean_tokens.pop())
@@ -3774,6 +3805,11 @@ def parse_queue_args(tokens: List[str]) -> List[QueueItem]:
 
     def flush_item() -> None:
         nonlocal cur_series_words, cur_specs
+        if cur_specs and not cur_series_words:
+            raise UsageError(
+                "Episode spec without a series name: " + " ".join(cur_specs)
+                + ". Nothing was downloaded."
+            )
         if cur_series_words:
             s_name = " ".join(cur_series_words).strip()
             if (s_name.startswith('"') and s_name.endswith('"')) or \
@@ -3787,10 +3823,11 @@ def parse_queue_args(tokens: List[str]) -> List[QueueItem]:
             cur_series_words = []
             cur_specs = []
 
-    for tok in tokens:
-        if is_spec_token(tok):
-            cur_specs.append(tok)
-        else:
+    for raw_token in tokens:
+        for tok in expand_spec_tokens([raw_token]):
+            if is_spec_token(tok):
+                cur_specs.append(tok)
+                continue
             # If we already have specs, or if the current token has whitespace (was a quoted string)
             # and we already have series words, flush the previous item!
             if cur_specs:
@@ -3871,9 +3908,15 @@ def execute_queue(api: EmbyAPI, dataset: DatasetManager, config: Dict[str, Any],
         info(f"=== Queue: {total_series} series to process ===")
 
     total_episodes_planned = 0
+    todo_episodes_planned = 0
     total_bytes_planned = 0
-    plans: List[Tuple[QueueItem, Optional[Dict[str, Any]]]] = []
+    total_unknown_sizes = 0
+    plans: List[Tuple[QueueItem, Dict[str, Any]]] = []
+    bad_items: List[str] = []
 
+    # Plan the *whole* queue before any transfer. Unresolvable series or
+    # invalid specs are a bad invocation: abort with exit 4 instead of
+    # warning-and-continuing (bug report 2026-11-14).
     for item in queue:
         try:
             series = api.resolve_series(item.series, item.series_id)
@@ -3884,10 +3927,38 @@ def execute_queue(api: EmbyAPI, dataset: DatasetManager, config: Dict[str, Any],
                               include_specials=item.include_specials)
             plans.append((item, plan))
             total_episodes_planned += plan["summary"]["total"]
+            todo_episodes_planned += plan["summary"]["todo"]
             total_bytes_planned += (plan["summary"].get("todo_bytes") or 0)
+            total_unknown_sizes += (plan["summary"].get("unknown_sizes") or 0)
+        except (NotFoundError, UsageError) as exc:
+            bad_items.append(f"  {item.series!r}: {exc}")
+        except ToolError:
+            raise
         except Exception as exc:
-            plans.append((item, None))
-            warn(f"Warning: could not resolve {item.series}: {exc}")
+            raise ToolError(
+                f"Queue aborted before any download: failed to plan "
+                f"{item.series!r}: {exc}"
+            ) from exc
+
+    if bad_items:
+        raise UsageError(
+            "Queue aborted before any download: unresolved or invalid queue "
+            "items:\n" + "\n".join(bad_items) +
+            "\nFix the queue arguments and retry; nothing was downloaded."
+        )
+
+    if json_output:
+        emit_json_event(
+            "start", total_series=total_series,
+            total_episodes=total_episodes_planned,
+            todo_episodes=todo_episodes_planned,
+            total_bytes=total_bytes_planned,
+            unknown_sizes=total_unknown_sizes,
+        )
+    else:
+        info(f"Planned {todo_episodes_planned}/{total_episodes_planned} episodes "
+             f"(~{human_bytes(total_bytes_planned)}) "
+             f"across {total_series} series.")
 
     if notify_summary:
         notify(
@@ -4018,6 +4089,7 @@ def plan_queue(api: EmbyAPI, dataset: DatasetManager, config: Dict[str, Any],
     grand_total_bytes = 0
     grand_todo_bytes = 0
     series_plans = []
+    bad_items: List[str] = []
 
     for it in queue:
         try:
@@ -4033,8 +4105,19 @@ def plan_queue(api: EmbyAPI, dataset: DatasetManager, config: Dict[str, Any],
             series_plans.append(plan)
             if not json_output:
                 info(f"  {s['Name']} [{' '.join(it.spec)}]: {sm['todo']}/{sm['total']} eps, {human_bytes(sm['todo_bytes'])}")
+        except (NotFoundError, UsageError) as exc:
+            bad_items.append(f"  {it.series!r}: {exc}")
+        except ToolError:
+            raise
         except Exception as exc:
-            warn(f"  {it.series}: error resolving plan ({exc})")
+            raise ToolError(f"Could not plan {it.series!r}: {exc}") from exc
+
+    if bad_items:
+        raise UsageError(
+            "Queue plan aborted: unresolved or invalid queue items:\n"
+            + "\n".join(bad_items) +
+            "\nFix the queue arguments and retry."
+        )
 
     if json_output:
         emit_json({
@@ -4367,7 +4450,20 @@ def cmd_status(args: argparse.Namespace, config: Dict[str, Any],
     downloads_path = get_downloads_path(config)
     state = read_state(downloads_path)
     held = lock_is_held(downloads_path)
-    running = bool(held and state and state.get("running"))
+    pid = parse_int((state or {}).get("pid"))
+    pid_known = pid is not None
+    pid_alive = pid_known and _pid_is_alive(pid)
+    # A force-killed download can leave `running: true` behind in the state
+    # file even though the OS already released the lock. Never report that
+    # stale flag as a live download (bug report 2026-11-14).
+    stale = bool(state and state.get("running")
+                 and (not held or (pid_known and not pid_alive)))
+    running = bool(held and state and state.get("running")
+                   and (not pid_known or pid_alive))
+    if stale and state:
+        state = dict(state)
+        state["running"] = False
+        state["stale"] = True
     updated_ago = None
     updated = _parse_iso((state or {}).get("updated_at"))
     if updated:
@@ -4377,6 +4473,7 @@ def cmd_status(args: argparse.Namespace, config: Dict[str, Any],
         emit_json({
             "running": running,
             "lock_held": held,
+            "stale": stale,
             "downloads_path": downloads_path,
             "updated_ago_seconds": updated_ago,
             "state": state,
@@ -4394,6 +4491,9 @@ def cmd_status(args: argparse.Namespace, config: Dict[str, Any],
         return 0
     if not state.get("running"):
         info(f"Lock is held (pid {state.get('pid')}) but state is not running.")
+        return 0
+    if stale:
+        warn("Warning: state PID is dead; ignoring stale 'running' flag.")
         return 0
 
     percent = state.get("percent")

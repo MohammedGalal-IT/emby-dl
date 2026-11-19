@@ -485,7 +485,7 @@ class EmbyToolTest(unittest.TestCase):
         self.assertEqual(entry["series_id"], "s1")
         self.assertEqual(entry["relative_path"],
                          "Alpha Show/Season 1/Alpha Show - S01E01.mkv")
-        self.assertEqual(entry["tool_version"], "1.3.3")
+        self.assertEqual(entry["tool_version"], "1.3.4")
         self.assertGreaterEqual(int(entry["attempts"]), 1)
         series_dataset = json.loads(
             (self.downloads / "Alpha Show" / "downloaded_dataset.json")
@@ -1004,7 +1004,7 @@ class EmbyToolTest(unittest.TestCase):
         self.assertTrue(cache.exists())
         data = json.loads(cache.read_text(encoding="utf-8"))
         self.assertEqual(data["server_name"], "FakeKing")
-        self.assertEqual(data["tool_version"], "1.3.3")
+        self.assertEqual(data["tool_version"], "1.3.4")
         original = data["updated_at"]
 
         # --reset-caps clears the cache; the same command re-probes and
@@ -1156,6 +1156,109 @@ class EmbyToolTest(unittest.TestCase):
         self.assertTrue(beta_dest.exists())
         central = self.central()
         self.assertEqual(central["total_episodes"], 2)
+
+    # -- queue parser / safety regressions (bug report 2026-11-14) --------
+
+    def test_queue_recognizes_quoted_combined_spec(self):
+        """A single argv token like "S1 E1" is a spec, not a series name."""
+        res = self.run_tool("queue", "plan", "Alpha Show", "S1 E1", "--json")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        payload = self.last_json(res.stdout)
+        self.assertEqual(len(payload["queue_plans"]), 1)
+        self.assertEqual(payload["queue_plans"][0]["selection"],
+                         {"mode": "episodes", "season": 1, "low": 1, "high": None})
+        self.assertEqual(payload["summary"]["total_episodes"], 1)
+        self.assertNotIn("could not resolve", res.stdout + res.stderr)
+
+    def test_queue_no_delimiter_combined_specs_multiple_series(self):
+        """No token may be swallowed as a fake series when specs are quoted."""
+        self.state["series"].append(
+            {"Id": "s2", "Name": "Beta Show", "Type": "Series", "ProductionYear": 2021})
+        self.state["seasons"]["s2"] = [
+            {"Id": "se9", "IndexNumber": 1, "Name": "Season 1"}]
+        self.state["episodes"]["se9"] = [
+            make_episode("e91", 1, "Beta Pilot", 20_000)]
+        self.state["payloads"]["e91"] = pattern_bytes(20_000, 9)
+
+        res = self.run_tool("queue", "plan", "Alpha Show", "S1 E1",
+                            "Beta Show", "S1 E1", "--json")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        payload = self.last_json(res.stdout)
+        self.assertEqual(payload["summary"]["total_series"], 2)
+        self.assertEqual(payload["summary"]["total_episodes"], 2)
+        self.assertEqual([p["series"]["name"] for p in payload["queue_plans"]],
+                         ["Alpha Show", "Beta Show"])
+        self.assertNotIn("error resolving", res.stdout + res.stderr)
+
+    def test_queue_file_combined_spec_and_range(self):
+        q_file = self.tempdir / "queue_combined.txt"
+        q_file.write_text('Alpha Show "S1 E1-2"\n', encoding="utf-8")
+        res = self.run_tool("queue", "plan", "-f", str(q_file), "--json")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        payload = self.last_json(res.stdout)
+        self.assertEqual(payload["queue_plans"][0]["selection"],
+                         {"mode": "episodes", "season": 1, "low": 1, "high": "2"})
+        self.assertEqual(payload["summary"]["total_episodes"], 2)
+
+    def test_queue_rejects_spec_before_series(self):
+        res = self.run_tool("queue", "plan", "S1 E1", "Alpha Show", "--json")
+        self.assertEqual(res.returncode, 4, res.stdout + res.stderr)
+        error = self.last_json(res.stdout)
+        self.assertEqual(error["code"], 4)
+        self.assertIn("without a series name", error["error"])
+
+    def test_queue_unresolved_item_aborts_before_any_transfer(self):
+        """Bad queue input must fail with exit 4 before a single episode is fetched."""
+        res = self.run_tool("queue", "Alpha Show", "S1", "E1", ";",
+                            "Missing Show", "S1", "E1", "--json")
+        self.assertEqual(res.returncode, 4, res.stdout + res.stderr)
+        error = self.last_json(res.stdout)
+        self.assertEqual(error["code"], 4)
+        self.assertIn("Missing Show", error["error"])
+        self.assertFalse(self.dest(1, 1).exists())
+        self.assertEqual(self.stream_count("e11"), 0)
+
+    def test_queue_plan_unresolved_item_fails(self):
+        res = self.run_tool("queue", "plan", "Alpha Show", "S1", ";",
+                            "Missing Show", "S1", "--json")
+        self.assertEqual(res.returncode, 4, res.stdout + res.stderr)
+        error = self.last_json(res.stdout)
+        self.assertEqual(error["code"], 4)
+        self.assertIn("Missing Show", error["error"])
+
+    def test_queue_start_event_reports_plan_before_transfer(self):
+        res = self.run_tool("queue", "Alpha Show", "S1", "E1", "--json")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        events = [json.loads(line) for line in res.stdout.splitlines()
+                  if line.strip().startswith("{")]
+        starts = [i for i, event in enumerate(events) if event.get("event") == "start"]
+        self.assertEqual(len(starts), 1)
+        start = events[starts[0]]
+        self.assertEqual(start["total_series"], 1)
+        self.assertEqual(start["total_episodes"], 1)
+        self.assertEqual(start["todo_episodes"], 1)
+        self.assertGreaterEqual(start["total_bytes"], 60_000)
+        progress = [i for i, event in enumerate(events)
+                    if event.get("event") == "progress"]
+        self.assertTrue(progress)
+        self.assertLess(starts[0], progress[0])
+
+    def test_status_json_invalidates_stale_dead_pid(self):
+        (self.downloads / ".emby_dl_state.json").write_text(json.dumps({
+            "running": True,
+            "status": "running",
+            "pid": 2_147_483_647,
+            "label": "Ghost Show S01E01",
+            "downloaded": 100,
+            "total": 200,
+            "updated_at": "2026-11-14T12:00:00",
+        }), encoding="utf-8")
+        res = self.run_tool("status", "--json")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        payload = self.last_json(res.stdout)
+        self.assertFalse(payload["running"])
+        self.assertFalse(payload["state"]["running"])
+        self.assertTrue(payload["state"].get("stale"))
 
 
 if __name__ == "__main__":
